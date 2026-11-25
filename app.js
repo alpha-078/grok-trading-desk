@@ -5,9 +5,10 @@
   const STORAGE_KEY_LIVE = 'grok_trading_desk_v1';
   const STORAGE_KEY_REPLAY = 'grok_trading_desk_replay_v1';
   const INITIAL_BALANCE = 135.0;
-  const LEVERAGE = 20;
-  const STOP_PCT = 0.006; // 0.6% price move => 12% ROE at 20x
-  const TP_PCT = 0.018;   // 1.8% price move => 36% ROE at 20x
+  const LEVERAGE = 10;
+  const STOP_PCT = 0.015; // 1.5% price move => 15% ROE at 10x
+  const TP_PCT = 0.018;   // 1.8% price move => 18% ROE at 10x
+  const LEGACY_LEVERAGE = 20; // fallback for positions opened before leverage was stored
   const TAKER_FEE = 0.00035; // 0.035% notional simulated taker fee
   const MAX_POSITIONS = 3;
   const POLL_MS = 4000;
@@ -108,7 +109,7 @@
           id: 'init-1',
           agent: 'Grok Bot',
           time: fmtTime(now),
-          text: 'Connecté à Hyperliquid · ' + COINS.length + ' perps en écoute (simulation 20x)',
+          text: 'Connecté à Hyperliquid · ' + COINS.length + ' perps en écoute (simulation ' + LEVERAGE + 'x)',
           badge: 'LIVE',
           kind: 'open'
         }
@@ -248,6 +249,12 @@
 
   function coinLabel(symbol) {
     return (COIN_MAP[symbol] && COIN_MAP[symbol].label) || symbol;
+  }
+
+  // New opens store leverage. Older saved positions were always 20x.
+  function posLeverage(pos) {
+    const lev = Number(pos && pos.leverage);
+    return Number.isFinite(lev) && lev > 0 ? lev : LEGACY_LEVERAGE;
   }
 
   function fmtTime(ts) {
@@ -502,7 +509,7 @@
     el.tradePopup.innerHTML = `
       <div class="popup-top">
         <span class="popup-brand">🤖 Grok Bot · ${trade.symbol}-USD</span>
-        <span class="popup-status">${trade.side} · ${LEVERAGE}x · Closed</span>
+        <span class="popup-status">${trade.side} · ${posLeverage(trade)}x · Closed</span>
       </div>
       <div class="popup-main">
         <span class="popup-pair">ROI ${trade.roe >= 0 ? '+' : ''}${trade.roe.toFixed(1)}%</span>
@@ -608,6 +615,7 @@
           pnl: netPnl,
           roe,
           margin: pos.margin,
+          leverage: posLeverage(pos),
           balanceAfter: state.balance,
           reason
         };
@@ -623,7 +631,7 @@
         if (netPnl < 0) {
           state.vetoCounts.COURT += 1;
           pushFeed('COURT', `stop $${coinLabel(pos.symbol)} ${fmtUsd(netPnl, true)}`, 'STOP', 'stop', nowTs);
-          pushToast('COURT', 'COURT: KILLED AT STOP', `#${state.history.length} ${coinLabel(pos.symbol)} ${pos.side.toLowerCase()} · ${fmtUsd(netPnl, true)} · stop 0.6%`, 'stop');
+          pushToast('COURT', 'COURT: KILLED AT STOP', `#${state.history.length} ${coinLabel(pos.symbol)} ${pos.side.toLowerCase()} · ${fmtUsd(netPnl, true)} · stop`, 'stop');
           setAgentCard('court', 'veto', `killed $${coinLabel(pos.symbol)} at stop`, '✕');
         } else {
           pushFeed('Grok Bot', `closed $${coinLabel(pos.symbol)} ${pos.side} ${fmtUsd(netPnl, true)}`, fmtUsd(netPnl, true), 'win', nowTs);
@@ -680,10 +688,10 @@
     el.grokActionText.classList.remove('veto', 'scanning');
 
     if (state.positions.length >= MAX_POSITIONS) {
-      setAgentCard('risk', 'approved', `20x · ${state.positions.length}/${MAX_POSITIONS} open · stop 0.6%`, '✓');
+      setAgentCard('risk', 'approved', `${LEVERAGE}x · ${state.positions.length}/${MAX_POSITIONS} open · stop 1.5%`, '✓');
       setAgentCard('narrative', 'approved', `${greenCoins}/${totalActive} green · ${state.positions.length} active`, '✓');
       el.grokHub.classList.add('active');
-      el.grokActionText.textContent = `${state.positions.length} open · 20x`;
+      el.grokActionText.textContent = `${state.positions.length} open · ${LEVERAGE}x`;
       return;
     }
 
@@ -695,8 +703,8 @@
       setAgentCard('sniper', 'scanning', 'watching entry windows', '•');
       setAgentCard('liquidity', 'approved', `board vol ${el.volumeMult.textContent} · ok`, '✓');
       setAgentCard('narrative', 'approved', `${greenCoins}/${totalActive} green · scanning`, '✓');
-      setAgentCard('court', 'approved', 'stop 0.6% · R:R ready', '✓');
-      setAgentCard('risk', 'approved', `20x · ${state.positions.length}/3 open · stop 0.6%`, '✓');
+      setAgentCard('court', 'approved', 'stop 1.5% · R:R ready', '✓');
+      setAgentCard('risk', 'approved', `${LEVERAGE}x · ${state.positions.length}/3 open · stop 1.5%`, '✓');
       return;
     }
 
@@ -733,7 +741,7 @@
       setAgentCard('narrative', 'approved', `${greenCoins}/${totalActive} green · ${cand.symbol} cleanest`, '✓');
     }
 
-    // Agent 5: COURT (Volatility vs 0.6% stop viability)
+    // Agent 5: COURT (Volatility vs 1.5% stop viability)
     let recentRangePct = 0.4;
     if (cand.candles && cand.candles.length >= 2) {
       const lastC = cand.candles[cand.candles.length - 1];
@@ -742,10 +750,10 @@
     }
     if (!killedBy && recentRangePct > 1.85) {
       state.vetoCounts.COURT += 1;
-      killedBy = { agent: 'COURT', card: 'court', reason: `wick ${recentRangePct.toFixed(2)}% > stop 0.6%` };
-      setAgentCard('court', 'veto', `VETO · stop 0.6% too tight`, '✕');
+      killedBy = { agent: 'COURT', card: 'court', reason: `wick ${recentRangePct.toFixed(2)}% > stop 1.5%` };
+      setAgentCard('court', 'veto', `VETO · stop 1.5% too tight`, '✕');
     } else if (!killedBy) {
-      setAgentCard('court', 'approved', 'dies at stop 0.6% → OK', '✓');
+      setAgentCard('court', 'approved', 'dies at stop 1.5% → OK', '✓');
     }
 
     // Agent 6: RISK (Treasury, max exposure & duplicate check)
@@ -755,7 +763,7 @@
       killedBy = { agent: 'RISK', card: 'risk', reason: alreadyHolding ? `${cand.symbol} déjà ouvert` : 'marge insuffisante' };
       setAgentCard('risk', 'veto', `VETO · ${alreadyHolding ? 'déjà en cours' : 'low margin'}`, '✕');
     } else if (!killedBy) {
-      setAgentCard('risk', 'approved', `20x · ${state.positions.length + 1}/3 open · stop 0.6%`, '✓');
+      setAgentCard('risk', 'approved', `${LEVERAGE}x · ${state.positions.length + 1}/3 open · stop 1.5%`, '✓');
     }
 
     if (killedBy) {
@@ -769,7 +777,7 @@
       return;
     }
 
-    // === ALL 6 AGENTS APPROVED -> OPEN 20x PAPER POSITION ===
+    // === ALL 6 AGENTS APPROVED -> OPEN 10x PAPER POSITION ===
     const notional = marginAlloc * LEVERAGE;
     const size = notional / cand.price;
     const entryFee = notional * TAKER_FEE;
@@ -790,6 +798,7 @@
       peakPrice: cand.price,
       stopPrice,
       tpPrice,
+      leverage: LEVERAGE,
       margin: marginAlloc,
       entryFee,
       openedAt: nowTs,
@@ -798,9 +807,9 @@
     state.positions.push(newPos);
 
     el.grokHub.classList.add('active');
-    el.grokActionText.textContent = `${state.positions.length} ${dir.toLowerCase()}s · 20x`;
-    pushFeed('Grok Bot', `${dir === 'Long' ? 'L' : 'S'} $${coinLabel(cand.symbol)} @ $${fmtPrice(cand.price)} · 20x`, 'OPEN', 'open', nowTs);
-    pushToast('OPEN', `${dir.toUpperCase()} $${coinLabel(cand.symbol)} · 20x`, `Entry $${fmtPrice(cand.price)} · Margin ${fmtUsd(marginAlloc)} · Stop 0.6%`, 'info');
+    el.grokActionText.textContent = `${state.positions.length} ${dir.toLowerCase()}s · ${LEVERAGE}x`;
+    pushFeed('Grok Bot', `${dir === 'Long' ? 'L' : 'S'} $${coinLabel(cand.symbol)} @ $${fmtPrice(cand.price)} · ${LEVERAGE}x`, 'OPEN', 'open', nowTs);
+    pushToast('OPEN', `${dir.toUpperCase()} $${coinLabel(cand.symbol)} · ${LEVERAGE}x`, `Entry $${fmtPrice(cand.price)} · Margin ${fmtUsd(marginAlloc)} · Stop 1.5%`, 'info');
   }
 
   // Rendering
@@ -868,7 +877,7 @@
             <span class="coin-cell">
               <span class="coin-mini-dot" style="background:${coinMeta.color}">${coinMeta.short}</span>
               ${coinLabel(pos.symbol)}
-              <span class="lev-tag">20x</span>
+              <span class="lev-tag">${posLeverage(pos)}x</span>
             </span>
           </td>
           <td><span class="side-pill ${pos.side.toLowerCase()}">${pos.side}</span></td>
@@ -1025,10 +1034,10 @@
       b.style.top = `${yPct}%`;
       b.style.backgroundColor = coinMeta.color;
       b.textContent = coinMeta.short.slice(0, 2);
-      b.title = `${fmtUsd(tr.pnl, true)} 20x ${tr.symbol}`;
+      b.title = `${fmtUsd(tr.pnl, true)} ${posLeverage(tr)}x ${tr.symbol}`;
 
       const showTip = () => {
-        el.chartTooltip.innerHTML = `<strong>${fmtUsd(tr.pnl, true)}</strong> · 20x · ${tr.symbol} ${tr.side} (${tr.roe >= 0 ? '+' : ''}${tr.roe.toFixed(1)}%)`;
+        el.chartTooltip.innerHTML = `<strong>${fmtUsd(tr.pnl, true)}</strong> · ${posLeverage(tr)}x · ${tr.symbol} ${tr.side} (${tr.roe >= 0 ? '+' : ''}${tr.roe.toFixed(1)}%)`;
         el.chartTooltip.style.left = `${Math.min(72, Math.max(8, xPct))}%`;
         el.chartTooltip.style.top = `${Math.max(8, yPct - 18)}%`;
         el.chartTooltip.classList.remove('hidden');
@@ -1086,8 +1095,8 @@
       { key: 'SNIPER', cls: 'sniper', rule: 'first 15m of a fresh pump', val: state.vetoCounts.SNIPER, unit: 'vetoes' },
       { key: 'LIQUIDITY', cls: 'liquidity', rule: 'vol < 0.42x avg or delisted', val: state.vetoCounts.LIQUIDITY, unit: 'vetoes' },
       { key: 'NARRATIVE', cls: 'narrative', rule: 'no lone wolf vs board', val: state.vetoCounts.NARRATIVE, unit: 'vetoes' },
-      { key: 'COURT', cls: 'court', rule: 'kills at 0.6% stop / noisy wick', val: state.vetoCounts.COURT, unit: 'stops/vetoes' },
-      { key: 'RISK', cls: 'risk', rule: '20x · max 3 open · stop 0.6%', val: state.vetoCounts.RISK, unit: 'vetoes' },
+      { key: 'COURT', cls: 'court', rule: 'kills at 1.5% stop / noisy wick', val: state.vetoCounts.COURT, unit: 'stops/vetoes' },
+      { key: 'RISK', cls: 'risk', rule: `${LEVERAGE}x · max 3 open · stop 1.5%`, val: state.vetoCounts.RISK, unit: 'vetoes' },
       { key: 'GROK', cls: 'grok', rule: `${COINS.length} perps real-time scans`, val: state.vetoCounts.GROK_SCANS, unit: 'scans', neutral: true }
     ];
     el.vetoList.innerHTML = rows.map(r => `

@@ -1,7 +1,7 @@
 {
   "name": "Grok Bot Trading Desk",
   "short_name": "Grok Desk",
-  "description": "Simulation de trading perpétuel 20x sur prix réels Hyperliquid avec 6 agents IA (argent fictif uniquement).",
+  "description": "Simulation de trading perpétuel 10x sur prix réels Hyperliquid avec 6 agents IA (argent fictif uniquement).",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",

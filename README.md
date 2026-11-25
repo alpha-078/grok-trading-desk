@@ -1,6 +1,6 @@
 # Grok Bot Trading Desk (Simulation / Paper Money)
 
-Simulation de tableau de bord trading perpétuel 20x sur prix réels Hyperliquid (`api.hyperliquid.xyz`), inspirée de la vidéo `@x_cha1n`.
+Simulation de tableau de bord trading perpétuel 10x sur prix réels Hyperliquid (`api.hyperliquid.xyz`), inspirée de la vidéo `@x_cha1n`.
 
 > ⚠️ **Simulation uniquement (`Replay on real prices: paper money`)** — Aucun ordre réel, aucune clé API, aucun wallet connecté. Solde fictif initial : **$135.00 USDC**.
 
