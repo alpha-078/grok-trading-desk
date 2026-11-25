@@ -21,15 +21,15 @@
     { symbol: 'BTC',      label: 'BTC',   short: 'BTC', color: '#f7931a' },
     { symbol: 'ETH',      label: 'ETH',   short: 'ETH', color: '#627eea' },
     { symbol: 'SOL',      label: 'SOL',   short: 'SOL', color: '#9945ff' },
-    { symbol: 'BNB',      label: 'BNB',   short: 'BNB', color: '#f3ba2f' },
     { symbol: 'HYPE',     label: 'HYPE',  short: 'HYP', color: '#00d1c7' },
     { symbol: 'ZEC',      label: 'ZEC',   short: 'ZEC', color: '#f4b728' },
-    { symbol: 'ASTER',    label: 'ASTER', short: 'AST', color: '#e879f9' },
     { symbol: 'UNI',      label: 'UNI',   short: 'UNI', color: '#ff007a' },
     { symbol: 'DOGE',     label: 'DOGE',  short: 'DOG', color: '#eab308' },
-    { symbol: 'CC',       label: 'CC',    short: 'CC',  color: '#34d399' },
     { symbol: 'xyz:NVDA', label: 'NVDA',  short: 'NVD', color: '#76b900', dex: 'xyz' },
-    { symbol: 'PUMP',     label: 'PUMP',  short: 'PMP', color: '#10b981' }
+    { symbol: 'PUMP',     label: 'PUMP',  short: 'PMP', color: '#10b981' },
+    { symbol: 'XRP',      label: 'XRP',   short: 'XRP', color: '#23292f' },
+    { symbol: 'NEAR',     label: 'NEAR',  short: 'NEAR', color: '#00c08b' },
+    { symbol: 'XMR',      label: 'XMR',   short: 'XMR', color: '#ff6600' }
   ];
 
   const COIN_MAP = Object.fromEntries(COINS.map(c => [c.symbol, c]));
