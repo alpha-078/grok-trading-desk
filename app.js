@@ -428,6 +428,15 @@
     el.hlStatusText.textContent = text;
   }
 
+
+  // Fixed 1.8% take-profit from entry. Recomputed if a saved position has no tpPrice.
+  function takeProfitPrice(pos) {
+    if (Number.isFinite(pos.tpPrice) && pos.tpPrice > 0) return pos.tpPrice;
+    const entry = Number(pos.entryPrice);
+    if (!Number.isFinite(entry) || entry <= 0) return 0;
+    return pos.side === 'Long' ? entry * (1 + TP_PCT) : entry * (1 - TP_PCT);
+  }
+
   // Paper Trading Engine + 6 Agents
   function calcPositionMetrics(pos, markPrice) {
     const priceDiff = pos.side === 'Long'
@@ -767,6 +776,9 @@
     const stopPrice = dir === 'Long'
       ? cand.price * (1 - STOP_PCT)
       : cand.price * (1 + STOP_PCT);
+    const tpPrice = dir === 'Long'
+      ? cand.price * (1 + TP_PCT)
+      : cand.price * (1 - TP_PCT);
 
     state.balance -= marginAlloc;
     const newPos = {
@@ -777,6 +789,7 @@
       entryPrice: cand.price,
       peakPrice: cand.price,
       stopPrice,
+      tpPrice,
       margin: marginAlloc,
       entryFee,
       openedAt: nowTs,
@@ -837,7 +850,7 @@
 
   function renderPositionsTable() {
     if (state.positions.length === 0) {
-      el.positionsTbody.innerHTML = `<tr class="empty-row"><td colspan="8">Aucune position ouverte — les 6 agents analysent Hyperliquid…</td></tr>`;
+      el.positionsTbody.innerHTML = `<tr class="empty-row"><td colspan="9">Aucune position ouverte — les 6 agents analysent Hyperliquid…</td></tr>`;
       return;
     }
     el.positionsTbody.innerHTML = state.positions.map(pos => {
@@ -848,6 +861,7 @@
       const netRoe = (netEst / pos.margin) * 100;
       const coinMeta = COIN_MAP[pos.symbol] || { color: '#8b5cf6', short: pos.symbol.slice(0, 3) };
       const cls = netEst >= 0 ? 'pnl-pos' : 'pnl-neg';
+      const tpPx = takeProfitPrice(pos);
       return `
         <tr>
           <td>
@@ -863,6 +877,7 @@
           <td>${fmtPrice(mark)}</td>
           <td class="${cls}">${fmtUsd(netEst, true)} (${netRoe >= 0 ? '+' : ''}${netRoe.toFixed(1)}%)</td>
           <td class="stop-cell">${fmtPrice(pos.stopPrice)}</td>
+          <td class="tp-cell">${fmtPrice(tpPx)}</td>
           <td class="right">${fmtUsd(pos.margin)}</td>
         </tr>
       `;
