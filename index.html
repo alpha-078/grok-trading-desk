@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <title>Grok Bot Trading Desk — Simulation Hyperliquid 20x</title>
+  <meta name="description" content="Grok Bot Trading Desk — Tableau de bord de simulation paper trading 20x sur les prix réels Hyperliquid avec 6 agents IA et règle 1 veto = annulé." />
+  <meta name="theme-color" content="#11082b" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Grok Desk" />
+  <link rel="manifest" href="/manifest.json" />
+  <link rel="icon" type="image/png" sizes="192x192" href="/icons/icon-192.png" />
+  <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <!-- Confetti Canvas for Big Wins -->
+  <canvas id="confetti-canvas" aria-hidden="true"></canvas>
+
+  <!-- Floating Trade Closed Celebration Popup -->
+  <div id="trade-closed-popup" class="trade-popup hidden" role="status" aria-live="polite"></div>
+
+  <!-- Top Window Chrome Bar (mirrors video aesthetic) -->
+  <div class="window-chrome">
+    <div class="chrome-dots" aria-hidden="true">
+      <span class="dot red"></span>
+      <span class="dot yellow"></span>
+      <span class="dot green"></span>
+    </div>
+    <div class="chrome-title">grok — trading-desk — 6 agents — 10 meme perps</div>
+    <div class="chrome-right">
+      <span class="sim-badge" title="Simulation uniquement — aucun ordre réel">PAPER ONLY</span>
+    </div>
+  </div>
+
+  <main class="desk-shell">
+    <!-- 1. HERO HEADER -->
+    <header class="card hero-card">
+      <div class="hero-left">
+        <div class="grok-avatar-box" aria-hidden="true">
+          <svg viewBox="0 0 120 120" class="grok-svg">
+            <defs>
+              <radialGradient id="grokSphere" cx="35%" cy="30%" r="70%">
+                <stop offset="0%" stop-color="#ffffff" />
+                <stop offset="68%" stop-color="#e5e9f7" />
+                <stop offset="100%" stop-color="#aeb7d9" />
+              </radialGradient>
+            </defs>
+            <circle cx="60" cy="60" r="46" fill="url(#grokSphere)" />
+            <g transform="rotate(-14 60 60)">
+              <rect x="40" y="43" width="14" height="30" rx="7" fill="#131624" />
+              <rect x="65" y="43" width="14" height="30" rx="7" fill="#131624" />
+            </g>
+          </svg>
+        </div>
+
+        <div class="hero-info">
+          <h1 class="hero-title">
+            <span class="title-white">Grok Bot</span>
+            <span class="title-grad">Trading Desk</span>
+          </h1>
+          <div class="balance-label-row">
+            <span class="muted-label">BALANCE · USDC</span>
+            <span id="last-pnl-pill" class="delta-pill neutral">+$0.00</span>
+            <span class="paper-disclaimer">Replay on real prices: paper money · Simulation sans argent réel</span>
+          </div>
+          <div id="hero-balance" class="hero-balance positive">$135<span class="cents">.00</span></div>
+          <div class="hero-stats-pill" id="hero-stats-pill">
+            <strong id="mult-badge">1.00×</strong>
+            <span>·</span>
+            <span id="trades-summary">0 trades · 0 green · 0 red</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="hero-right">
+        <div id="toast-stack" class="toast-stack"></div>
+        <div class="hero-controls-row">
+          <div class="hl-badge" id="hl-status-badge" title="Connexion API publique Hyperliquid">
+            <span class="hl-dot"></span>
+            <span class="hl-logo">Hyperliquid</span>
+            <span id="hl-status-text" class="hl-state">Live API</span>
+          </div>
+          <div class="mode-controls">
+            <button id="btn-mode-live" class="ctrl-btn active" type="button" title="Prix Hyperliquid en direct (toutes les 4s)">⚡ Live Réel</button>
+            <button id="btn-mode-replay" class="ctrl-btn" type="button" title="Rejouer les 60 dernières minutes de vraies bougies Hyperliquid en accéléré">▶ Replay 45m</button>
+            <button id="btn-reset" class="ctrl-btn danger" type="button" title="Réinitialiser le compte fictif à $135.00">↻ Reset</button>
+            <button id="btn-install" class="ctrl-btn install hidden" type="button" title="Installer l'application">📲 Installer</button>
+          </div>
+        </div>
+      </div>
+    </header>
+
+    <!-- 2. BALANCE CURVE + TRADE BUBBLES -->
+    <section class="card chart-card" aria-label="Courbe du solde">
+      <div class="chart-header">
+        <div class="chart-title-group">
+          <h2 class="section-title">Balance</h2>
+          <span class="replay-subtitle" id="chart-mode-label">Replay on real prices: paper money</span>
+        </div>
+        <div class="chart-right-meta">
+          <span class="stop-tag">20x · stop 0.6%</span>
+          <span id="chart-balance-pill" class="chart-balance-pill">$135.00</span>
+        </div>
+      </div>
+
+      <div class="chart-container" id="chart-container">
+        <svg id="equity-svg" viewBox="0 0 920 220" preserveAspectRatio="none" aria-label="Courbe d'évolution du solde"></svg>
+        <div id="chart-bubbles-layer" class="chart-bubbles-layer"></div>
+        <div id="chart-tooltip" class="chart-tooltip hidden"></div>
+      </div>
+    </section>
+
+    <!-- 3. POSITIONS & TRADE HISTORY -->
+    <section class="card ledger-card" aria-label="Positions et historique des trades">
+      <div class="ledger-tabs-bar">
+        <div class="tabs-group" role="tablist">
+          <button id="tab-positions" class="tab-btn active" role="tab" aria-selected="true" type="button">
+            Positions (<span id="count-positions">0</span>)
+          </button>
+          <button id="tab-history" class="tab-btn" role="tab" aria-selected="false" type="button">
+            Trade History (<span id="count-history">0</span>)
+          </button>
+        </div>
+        <div class="cross-label">Cross · 20x · Paper</div>
+      </div>
+
+      <div class="account-summary-strip">
+        <div class="summary-item">
+          <span class="s-label">Account Equity</span>
+          <span id="sum-equity" class="s-val">$135.00</span>
+        </div>
+        <div class="summary-item">
+          <span class="s-label">Unrealized PnL</span>
+          <span id="sum-upnl" class="s-val neutral">+$0.00</span>
+        </div>
+        <div class="summary-item">
+          <span class="s-label">Margin Used</span>
+          <span id="sum-margin" class="s-val">$0.00</span>
+        </div>
+        <div class="summary-item">
+          <span class="s-label">Stop</span>
+          <span class="s-val">0.6% at entry</span>
+        </div>
+      </div>
+
+      <div class="table-scroll">
+        <table id="positions-table" class="desk-table">
+          <thead>
+            <tr>
+              <th>Coin</th>
+              <th>Side</th>
+              <th>Size</th>
+              <th>Entry Price</th>
+              <th>Mark Price</th>
+              <th>PnL (ROE %)</th>
+              <th>Stop</th>
+              <th class="right">Margin</th>
+            </tr>
+          </thead>
+          <tbody id="positions-tbody">
+            <tr class="empty-row"><td colspan="8">Aucune position ouverte — Grok analyse le marché…</td></tr>
+          </tbody>
+        </table>
+
+        <table id="history-table" class="desk-table hidden">
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Coin</th>
+              <th>Side</th>
+              <th>Size</th>
+              <th>Entry Price</th>
+              <th>Mark Price</th>
+              <th>PnL (ROE %)</th>
+              <th>Margin</th>
+              <th class="right">Balance</th>
+            </tr>
+          </thead>
+          <tbody id="history-tbody">
+            <tr class="empty-row"><td colspan="9">Aucun trade clôturé pour l'instant</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 4. SIX AGENTS PANEL -->
+    <section class="card agents-card" aria-label="6 Agents IA et règle de veto">
+      <div class="agents-header">
+        <span class="agents-banner">6 AGENTS → ONE GROK · ONE VETO KILLS</span>
+        <span class="online-pill"><span class="online-dot"></span>6/6 online</span>
+      </div>
+
+      <div class="agents-arena">
+        <!-- Left column -->
+        <div class="agents-col">
+          <article class="agent-box" id="agent-sniper" data-agent="SNIPER">
+            <div class="agent-icon icon-sniper">🎯</div>
+            <div class="agent-meta">
+              <div class="agent-name-row">
+                <span class="agent-name">SNIPER</span>
+                <span class="agent-badge" id="badge-sniper">✓</span>
+              </div>
+              <div class="agent-desc" id="desc-sniper">no fresh pump · clear</div>
+            </div>
+          </article>
+
+          <article class="agent-box" id="agent-liquidity" data-agent="LIQUIDITY">
+            <div class="agent-icon icon-liq">📊</div>
+            <div class="agent-meta">
+              <div class="agent-name-row">
+                <span class="agent-name">LIQUIDITY</span>
+                <span class="agent-badge" id="badge-liquidity">✓</span>
+              </div>
+              <div class="agent-desc" id="desc-liquidity">volume 1.0x avg · ok</div>
+            </div>
+          </article>
+        </div>
+
+        <!-- Center Grok Hub + Risk Guard -->
+        <div class="agents-center-col">
+          <div class="grok-hub" id="agent-grok">
+            <div class="grok-ring"></div>
+            <div class="grok-hub-inner">
+              <svg viewBox="0 0 120 120" class="grok-hub-svg" aria-hidden="true">
+                <circle cx="60" cy="60" r="46" fill="url(#grokSphere)" />
+                <g transform="rotate(-14 60 60)">
+                  <rect x="40" y="43" width="14" height="30" rx="7" fill="#131624" />
+                  <rect x="65" y="43" width="14" height="30" rx="7" fill="#131624" />
+                </g>
+              </svg>
+            </div>
+          </div>
+          <div class="grok-status-line" id="grok-status-line">
+            <span class="grok-label">GROK</span>
+            <span>·</span>
+            <span id="grok-action-text" class="grok-action">scanning</span>
+          </div>
+
+          <article class="agent-box compact" id="agent-risk" data-agent="RISK">
+            <div class="agent-icon icon-risk">🛡️</div>
+            <div class="agent-meta">
+              <div class="agent-name-row">
+                <span class="agent-name">RISK</span>
+                <span class="agent-badge" id="badge-risk">✓</span>
+              </div>
+              <div class="agent-desc" id="desc-risk">20x · 0/3 open · stop 0.6%</div>
+            </div>
+          </article>
+        </div>
+
+        <!-- Right column -->
+        <div class="agents-col">
+          <article class="agent-box" id="agent-narrative" data-agent="NARRATIVE">
+            <div class="agent-icon icon-narrative">𝕏</div>
+            <div class="agent-meta">
+              <div class="agent-name-row">
+                <span class="agent-name">NARRATIVE</span>
+                <span class="agent-badge" id="badge-narrative">✓</span>
+              </div>
+              <div class="agent-desc" id="desc-narrative">scanning board breadth</div>
+            </div>
+          </article>
+
+          <article class="agent-box" id="agent-court" data-agent="COURT">
+            <div class="agent-icon icon-court">⚖️</div>
+            <div class="agent-meta">
+              <div class="agent-name-row">
+                <span class="agent-name">COURT</span>
+                <span class="agent-badge" id="badge-court">✓</span>
+              </div>
+              <div class="agent-desc" id="desc-court">stop 0.6% · R:R ready</div>
+            </div>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <!-- 5. BOTTOM BENTO: BOARD + FEED + VETO TRACKING -->
+    <section class="bottom-grid">
+      <!-- BOARD · 10 MEME PERPS -->
+      <article class="card board-card">
+        <div class="panel-header">
+          <span class="panel-title">BOARD · 10 MEME PERPS</span>
+          <span class="panel-sub" id="board-tf">Hyperliquid</span>
+        </div>
+        <div id="board-grid" class="board-grid"></div>
+        <div class="meter-row">
+          <span class="meter-label">VOLUME</span>
+          <div class="meter-track"><div id="volume-bar-fill" class="meter-fill" style="width: 55%"></div></div>
+          <span id="volume-mult" class="meter-val">1.0x</span>
+        </div>
+      </article>
+
+      <!-- FEED · TRACKING -->
+      <article class="card feed-card">
+        <div class="panel-header">
+          <span class="panel-title">FEED · TRACKING</span>
+          <span class="live-tag"><span class="online-dot"></span>live</span>
+        </div>
+        <div id="feed-list" class="feed-list"></div>
+        <div class="meter-row">
+          <span class="meter-label">grok signal</span>
+          <div class="meter-track"><div id="signal-bar-fill" class="meter-fill signal" style="width: 62%"></div></div>
+          <span id="signal-val" class="meter-val">0.62</span>
+        </div>
+      </article>
+
+      <!-- VETO · TRACKING -->
+      <article class="card veto-card">
+        <div class="panel-header">
+          <span class="panel-title">VETO · TRACKING</span>
+        </div>
+        <div class="veto-sub">one veto kills · no vote, no override</div>
+        <div id="veto-list" class="veto-list"></div>
+      </article>
+    </section>
+
+    <footer class="desk-footer">
+      <span>Grok Bot Trading Desk · Simulation sur prix réels Hyperliquid (`api.hyperliquid.xyz`) · Argent fictif uniquement (Paper Money, levier 20x simulé, aucune clé ni ordre réel).</span>
+    </footer>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>
