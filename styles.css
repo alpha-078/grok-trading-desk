@@ -793,6 +793,19 @@ html, body {
   border-color: rgba(96, 165, 250, 0.65);
   box-shadow: 0 0 18px rgba(56, 189, 248, 0.22);
 }
+.agent-box.skipped {
+  opacity: 0.62;
+  border-color: rgba(148, 163, 184, 0.28);
+  box-shadow: none;
+  background: rgba(18, 14, 36, 0.7);
+}
+.agent-box.skipped .agent-badge {
+  color: #94a3b8;
+}
+.agent-box.skipped .agent-desc {
+  color: #7a7499;
+  font-style: italic;
+}
 
 .agent-icon {
   width: 42px;

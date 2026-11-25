@@ -2,7 +2,8 @@
   'use strict';
 
   const HL_INFO_URL = 'https://api.hyperliquid.xyz/info';
-  const STORAGE_KEY = 'grok_trading_desk_v1';
+  const STORAGE_KEY_LIVE = 'grok_trading_desk_v1';
+  const STORAGE_KEY_REPLAY = 'grok_trading_desk_replay_v1';
   const INITIAL_BALANCE = 135.0;
   const LEVERAGE = 20;
   const STOP_PCT = 0.006; // 0.6% price move => 12% ROE at 20x
@@ -11,6 +12,9 @@
   const MAX_POSITIONS = 3;
   const POLL_MS = 4000;
   const REPLAY_STEP_MS = 650;
+  const CANDLE_REFRESH_MS = 60000;
+  const CANDLE_STAGGER_MS = 450;
+  const VETO_AGENT_ORDER = ['sniper', 'liquidity', 'narrative', 'court', 'risk'];
 
   const COINS = [
     { symbol: 'WIF',    label: 'WIF',    short: 'WIF', color: '#a855f7' },
@@ -28,13 +32,17 @@
   const COIN_MAP = Object.fromEntries(COINS.map(c => [c.symbol, c]));
 
   // Runtime state
-  let state = loadState();
+  let state = loadState('live');
   let market = {}; // symbol -> { price, prevDayPx, dayNtlVlm, isDelisted, chg24h, chg15m, volRatio, candles: [] }
   let mode = 'live'; // 'live' | 'replay'
   let liveTimer = null;
   let replayTimer = null;
+  let replayReturnTimer = null;
   let replayFrames = [];
   let replayIdx = 0;
+  let lastCandleRefreshAt = 0;
+  let candleRefreshInFlight = false;
+  let liveMarketBackup = null;
   let activeTab = 'positions';
   let deferredInstallPrompt = null;
   let popupTimer = null;
@@ -116,9 +124,13 @@
     };
   }
 
-  function loadState() {
+  function storageKey(which = mode) {
+    return which === 'replay' ? STORAGE_KEY_REPLAY : STORAGE_KEY_LIVE;
+  }
+
+  function loadState(which = 'live') {
     try {
-      const raw = localStorage.getItem(STORAGE_KEY);
+      const raw = localStorage.getItem(storageKey(which));
       if (!raw) return defaultState();
       const parsed = JSON.parse(raw);
       if (!parsed || typeof parsed.balance !== 'number') return defaultState();
@@ -139,9 +151,25 @@
       }
       if (state.feed.length > 60) state.feed = state.feed.slice(0, 60);
       if (state.history.length > 150) state.history = state.history.slice(0, 150);
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+      // Persist only under the current mode's key — replay never overwrites live.
+      localStorage.setItem(storageKey(mode), JSON.stringify(state));
     } catch {
       // Ignore quota errors
+    }
+  }
+
+  function backupLiveMarket() {
+    try {
+      liveMarketBackup = JSON.parse(JSON.stringify(market));
+    } catch {
+      liveMarketBackup = market;
+    }
+  }
+
+  function restoreLiveMarket() {
+    if (liveMarketBackup) {
+      market = liveMarketBackup;
+      liveMarketBackup = null;
     }
   }
 
@@ -255,10 +283,30 @@
     setHlStatus(true, mode === 'replay' ? 'Replay · HL Data' : 'Live API');
   }
 
+  function applyCandlesToMarket(symbol, candles) {
+    if (!Array.isArray(candles) || !market[symbol] || candles.length === 0) return;
+    market[symbol].candles = candles;
+    const curPx = market[symbol].price || parseFloat(candles[candles.length - 1].c);
+    if (candles.length >= 4) {
+      const oldPx = parseFloat(candles[Math.max(0, candles.length - 4)].o);
+      if (oldPx > 0 && curPx > 0) {
+        market[symbol].chg15m = ((curPx - oldPx) / oldPx) * 100;
+      }
+    }
+    const vols = candles.map(k => parseFloat(k.v || '0'));
+    const avgV = vols.reduce((a, b) => a + b, 0) / Math.max(1, vols.length);
+    const lastV = vols[vols.length - 1] || 0;
+    market[symbol].volRatio = avgV > 0 ? Math.min(3.5, Math.max(0.2, lastV / avgV)) : 1.0;
+  }
+
+  function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
   async function preloadCandles(interval = '5m', minutesBack = 120) {
     const endTime = Date.now();
     const startTime = endTime - minutesBack * 60 * 1000;
-    const activeCoins = COINS.filter(c => !market[c.symbol]?.isDelisted);
+    const activeCoins = COINS.filter(c => market[c.symbol] && !market[c.symbol].isDelisted);
 
     await Promise.all(
       activeCoins.map(async c => {
@@ -267,19 +315,44 @@
             type: 'candleSnapshot',
             req: { coin: c.symbol, interval, startTime, endTime }
           });
-          if (Array.isArray(candles) && market[c.symbol]) {
-            market[c.symbol].candles = candles;
-            if (candles.length >= 4) {
-              const oldPx = parseFloat(candles[Math.max(0, candles.length - 4)].o);
-              const curPx = market[c.symbol].price || parseFloat(candles[candles.length - 1].c);
-              if (oldPx > 0) market[c.symbol].chg15m = ((curPx - oldPx) / oldPx) * 100;
-            }
-          }
+          applyCandlesToMarket(c.symbol, candles);
         } catch {
           // Ignore single coin candle error
         }
       })
     );
+  }
+
+  // Live-mode only: refresh 5m candles every 60s so COURT/chg15m/volRatio stay current.
+  // Staggers one coin at a time and skips delisted markets to avoid hammering the API.
+  async function refreshLiveCandles({ force = false } = {}) {
+    if (mode !== 'live') return;
+    if (candleRefreshInFlight) return;
+    const now = Date.now();
+    if (!force && lastCandleRefreshAt && now - lastCandleRefreshAt < CANDLE_REFRESH_MS) return;
+
+    candleRefreshInFlight = true;
+    lastCandleRefreshAt = now;
+    try {
+      const activeCoins = COINS.filter(c => market[c.symbol] && !market[c.symbol].isDelisted);
+      const endTime = Date.now();
+      const startTime = endTime - 120 * 60 * 1000;
+      for (const c of activeCoins) {
+        if (mode !== 'live') break;
+        try {
+          const candles = await hlPost({
+            type: 'candleSnapshot',
+            req: { coin: c.symbol, interval: '5m', startTime, endTime }
+          });
+          applyCandlesToMarket(c.symbol, candles);
+        } catch {
+          // Ignore single coin candle error
+        }
+        await sleep(CANDLE_STAGGER_MS);
+      }
+    } finally {
+      candleRefreshInFlight = false;
+    }
   }
 
   function setHlStatus(ok, text) {
@@ -379,10 +452,18 @@
     const descEl = document.getElementById(`desc-${id}`);
     const badgeEl = document.getElementById(`badge-${id}`);
     if (!box) return;
-    box.classList.remove('approved', 'veto', 'scanning');
+    box.classList.remove('approved', 'veto', 'scanning', 'skipped');
     if (status) box.classList.add(status);
     if (descEl) descEl.textContent = desc;
     if (badgeEl) badgeEl.textContent = badgeText;
+  }
+
+  function markLaterAgentsSkipped(vetoCardId) {
+    const idx = VETO_AGENT_ORDER.indexOf(vetoCardId);
+    if (idx < 0) return;
+    VETO_AGENT_ORDER.slice(idx + 1).forEach(id => {
+      setAgentCard(id, 'skipped', 'skipped / not consulted', '—');
+    });
   }
 
   function monitorOpenPositions(nowTs) {
@@ -602,6 +683,7 @@
     }
 
     if (killedBy) {
+      markLaterAgentsSkipped(killedBy.card);
       el.grokHub.classList.add('veto');
       el.grokActionText.classList.add('veto');
       el.grokActionText.textContent = `${killedBy.agent}: VETO`;
@@ -996,6 +1078,9 @@
     if (mode !== 'live') return;
     try {
       await fetchMarketSnapshot();
+      // Fire-and-forget 60s candle refresh so COURT uses current 5m candles
+      // without blocking the 4s live poll.
+      refreshLiveCandles();
       const now = Date.now();
       monitorOpenPositions(now);
       runSixAgentCycle(now);
@@ -1014,18 +1099,32 @@
   }
 
   function startLiveMode() {
+    const comingFromReplay = mode === 'replay';
+    if (comingFromReplay) {
+      saveState(); // write replay snapshot to the replay key only
+    }
     stopTimers();
     mode = 'live';
+    if (comingFromReplay) {
+      state = loadState('live');
+      restoreLiveMarket();
+    }
     el.btnLive.classList.add('active');
     el.btnReplay.classList.remove('active');
+    el.btnReplay.textContent = '▶ Replay 45m';
     el.chartModeLabel.textContent = 'Replay on real prices: paper money · Live Hyperliquid';
     liveTick();
     liveTimer = setInterval(liveTick, POLL_MS);
+    if (comingFromReplay) refreshLiveCandles({ force: true });
   }
 
   async function startReplayMode() {
+    // Persist the live account first, then leave it untouched for the whole replay.
+    if (mode === 'live') {
+      saveState();
+      backupLiveMarket();
+    }
     stopTimers();
-    mode = 'replay';
     el.btnReplay.classList.add('active');
     el.btnLive.classList.remove('active');
     el.btnReplay.textContent = '⏳ Chargement…';
@@ -1063,7 +1162,8 @@
         return { ts: bc.t, prices };
       });
 
-      // Reset fresh $135 replay simulation so user sees the full 45m run clearly
+      // Switch to a fresh $135 replay session (separate key / never touches live state)
+      mode = 'replay';
       state = defaultState();
       const t0 = replayFrames[0]?.ts || Date.now();
       state.equityCurve = [{ t: t0, v: INITIAL_BALANCE, label: fmtShortTime(t0) }];
@@ -1078,13 +1178,19 @@
       replayIdx = 0;
       el.btnReplay.textContent = '▶ Replay 45m';
       setHlStatus(true, 'Replay · 1m Candles');
+      saveState();
+      renderAll();
 
       replayTimer = setInterval(() => {
         if (replayIdx >= replayFrames.length) {
           stopTimers();
-          pushFeed('Grok Bot', 'Fin du Replay 45m — retour possible en Live Réel', 'DONE', 'win');
+          pushFeed('Grok Bot', 'Fin du Replay 45m — retour au Live dans 3s', 'DONE', 'win');
           saveState();
           renderAll();
+          replayReturnTimer = setTimeout(() => {
+            replayReturnTimer = null;
+            startLiveMode();
+          }, 3000);
           return;
         }
         const frame = replayFrames[replayIdx++];
@@ -1118,8 +1224,10 @@
   function stopTimers() {
     if (liveTimer) clearInterval(liveTimer);
     if (replayTimer) clearInterval(replayTimer);
+    if (replayReturnTimer) clearTimeout(replayReturnTimer);
     liveTimer = null;
     replayTimer = null;
+    replayReturnTimer = null;
   }
 
   // Tabs & UI Event Handlers
@@ -1143,11 +1251,13 @@
   el.btnReplay.addEventListener('click', () => startReplayMode());
 
   el.btnReset.addEventListener('click', () => {
-    localStorage.removeItem(STORAGE_KEY);
+    const isReplay = mode === 'replay';
+    const label = isReplay ? 'la simulation Replay' : 'le compte Live';
+    const other = isReplay ? 'le compte Live' : 'le Replay';
+    if (!confirm(`Réinitialiser ${label} à $135.00 ? Cette action n'affecte pas ${other}.`)) return;
     state = defaultState();
-    saveState();
+    saveState(); // writes only the current mode's storage key
     renderAll();
-    if (mode === 'replay') startLiveMode();
   });
 
   // PWA Install Prompt & Service Worker
@@ -1177,6 +1287,7 @@
     try {
       await fetchMarketSnapshot();
       await preloadCandles('5m', 120);
+      lastCandleRefreshAt = Date.now();
       renderAll();
     } catch (e) {
       console.warn('Initial Hyperliquid fetch warning:', e);
