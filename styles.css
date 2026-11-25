@@ -947,11 +947,16 @@ html, body {
   color: var(--neon-green);
 }
 
-/* Board 10 Meme Perps */
+/* Board Perps */
 .board-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 7px;
+  gap: 6px;
+}
+@media (min-width: 1400px) {
+  .board-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
 }
 
 .board-tile {

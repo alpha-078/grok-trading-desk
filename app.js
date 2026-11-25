@@ -17,16 +17,18 @@
   const VETO_AGENT_ORDER = ['sniper', 'liquidity', 'narrative', 'court', 'risk'];
 
   const COINS = [
-    { symbol: 'WIF',    label: 'WIF',    short: 'WIF', color: '#a855f7' },
-    { symbol: 'PUMP',   label: 'PUMP',   short: 'PMP', color: '#10b981' },
-    { symbol: 'TRUMP',  label: 'TRUMP',  short: 'TRM', color: '#f59e0b' },
-    { symbol: 'kPEPE',  label: 'kPEPE',  short: 'PEP', color: '#22c55e' },
-    { symbol: 'DOGE',   label: 'DOGE',   short: 'DOG', color: '#eab308' },
-    { symbol: 'kFLOKI', label: 'kFLOKI', short: 'FLK', color: '#f97316' },
-    { symbol: 'MEW',    label: 'MEW',    short: 'MEW', color: '#ec4899' },
-    { symbol: 'kBONK',  label: 'kBONK',  short: 'BNK', color: '#fb923c' },
-    { symbol: 'POPCAT', label: 'POPCAT', short: 'POP', color: '#38bdf8' },
-    { symbol: 'PENGU',  label: 'PENGU',  short: 'PNG', color: '#60a5fa' }
+    { symbol: 'BTC',      label: 'BTC',   short: 'BTC', color: '#f7931a' },
+    { symbol: 'ETH',      label: 'ETH',   short: 'ETH', color: '#627eea' },
+    { symbol: 'SOL',      label: 'SOL',   short: 'SOL', color: '#9945ff' },
+    { symbol: 'BNB',      label: 'BNB',   short: 'BNB', color: '#f3ba2f' },
+    { symbol: 'HYPE',     label: 'HYPE',  short: 'HYP', color: '#00d1c7' },
+    { symbol: 'ZEC',      label: 'ZEC',   short: 'ZEC', color: '#f4b728' },
+    { symbol: 'ASTER',    label: 'ASTER', short: 'AST', color: '#e879f9' },
+    { symbol: 'UNI',      label: 'UNI',   short: 'UNI', color: '#ff007a' },
+    { symbol: 'DOGE',     label: 'DOGE',  short: 'DOG', color: '#eab308' },
+    { symbol: 'CC',       label: 'CC',    short: 'CC',  color: '#34d399' },
+    { symbol: 'xyz:NVDA', label: 'NVDA',  short: 'NVD', color: '#76b900', dex: 'xyz' },
+    { symbol: 'PUMP',     label: 'PUMP',  short: 'PMP', color: '#10b981' }
   ];
 
   const COIN_MAP = Object.fromEntries(COINS.map(c => [c.symbol, c]));
@@ -106,7 +108,7 @@
           id: 'init-1',
           agent: 'Grok Bot',
           time: fmtTime(now),
-          text: 'Connecté à Hyperliquid · 10 memecoins en écoute (simulation 20x)',
+          text: 'Connecté à Hyperliquid · ' + COINS.length + ' perps en écoute (simulation 20x)',
           badge: 'LIVE',
           kind: 'open'
         }
@@ -158,6 +160,49 @@
     }
   }
 
+  // Close leftover positions on coins no longer on the board.
+  // Margin is returned at entry (flat) so the saved free balance is preserved.
+  function sanitizeLegacyPositions() {
+    const known = new Set(COINS.map(c => c.symbol));
+    const open = Array.isArray(state.positions) ? state.positions : [];
+    const kept = [];
+    const dropped = [];
+    for (const pos of open) {
+      if (pos && known.has(pos.symbol)) kept.push(pos);
+      else if (pos) dropped.push(pos);
+    }
+    if (dropped.length === 0) {
+      state.positions = kept;
+      return false;
+    }
+    const nowTs = Date.now();
+    for (const pos of dropped) {
+      const margin = Number(pos.margin) || 0;
+      state.balance = Math.max(1.0, (Number(state.balance) || 0) + margin);
+      state.history = state.history || [];
+      state.history.unshift({
+        id: pos.id,
+        time: fmtShortTime(nowTs),
+        ts: nowTs,
+        curveTime: nowTs,
+        symbol: pos.symbol,
+        side: pos.side,
+        size: pos.size,
+        entryPrice: pos.entryPrice,
+        exitPrice: pos.entryPrice,
+        pnl: 0,
+        roe: 0,
+        margin,
+        balanceAfter: state.balance,
+        reason: 'BOARD UPDATE: coin retiré'
+      });
+      pushFeed('Grok Bot', `clôture $${coinLabel(pos.symbol)} (plus au board) · marge restituée`, 'FLAT', 'open', nowTs);
+    }
+    state.positions = kept;
+    saveState();
+    return true;
+  }
+
   function backupLiveMarket() {
     try {
       liveMarketBackup = JSON.parse(JSON.stringify(market));
@@ -176,6 +221,8 @@
   // Formatting helpers
   function fmtPrice(px) {
     if (!Number.isFinite(px) || px <= 0) return '0.00';
+    if (px >= 1000) return px.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    if (px >= 100) return px.toFixed(2);
     if (px >= 1) return px.toFixed(4);
     if (px >= 0.05) return px.toFixed(5);
     if (px >= 0.005) return px.toFixed(6);
@@ -190,9 +237,17 @@
   }
 
   function fmtSize(qty) {
+    if (!Number.isFinite(qty)) return '0';
     if (qty >= 1000) return Math.round(qty).toLocaleString('en-US');
     if (qty >= 10) return qty.toFixed(1);
-    return qty.toFixed(2);
+    if (qty >= 1) return qty.toFixed(2);
+    if (qty >= 0.1) return qty.toFixed(3);
+    if (qty >= 0.01) return qty.toFixed(4);
+    return qty.toFixed(5);
+  }
+
+  function coinLabel(symbol) {
+    return (COIN_MAP[symbol] && COIN_MAP[symbol].label) || symbol;
   }
 
   function fmtTime(ts) {
@@ -217,11 +272,23 @@
   }
 
   async function fetchMarketSnapshot() {
-    const data = await hlPost({ type: 'metaAndAssetCtxs' });
-    const universe = data[0]?.universe || [];
-    const ctxs = data[1] || [];
+    const dexes = [...new Set(COINS.map(c => c.dex || ''))];
+    const settled = await Promise.allSettled(
+      dexes.map(dex => dex
+        ? hlPost({ type: 'metaAndAssetCtxs', dex })
+        : hlPost({ type: 'metaAndAssetCtxs' }))
+    );
     const idxByName = {};
-    universe.forEach((m, i) => { idxByName[m.name] = { meta: m, ctx: ctxs[i] }; });
+    settled.forEach((res, i) => {
+      if (res.status !== 'fulfilled') {
+        console.warn('Hyperliquid meta fetch failed for dex', dexes[i] || 'default', res.reason);
+        return;
+      }
+      const data = res.value;
+      const universe = data[0]?.universe || [];
+      const ctxs = data[1] || [];
+      universe.forEach((m, j) => { idxByName[m.name] = { meta: m, ctx: ctxs[j] }; });
+    });
 
     let totalVolRatio = 0;
     let activeCount = 0;
@@ -546,13 +613,13 @@
 
         if (netPnl < 0) {
           state.vetoCounts.COURT += 1;
-          pushFeed('COURT', `stop $${pos.symbol} ${fmtUsd(netPnl, true)}`, 'STOP', 'stop', nowTs);
-          pushToast('COURT', 'COURT: KILLED AT STOP', `#${state.history.length} ${pos.symbol} ${pos.side.toLowerCase()} · ${fmtUsd(netPnl, true)} · stop 0.6%`, 'stop');
-          setAgentCard('court', 'veto', `killed $${pos.symbol} at stop`, '✕');
+          pushFeed('COURT', `stop $${coinLabel(pos.symbol)} ${fmtUsd(netPnl, true)}`, 'STOP', 'stop', nowTs);
+          pushToast('COURT', 'COURT: KILLED AT STOP', `#${state.history.length} ${coinLabel(pos.symbol)} ${pos.side.toLowerCase()} · ${fmtUsd(netPnl, true)} · stop 0.6%`, 'stop');
+          setAgentCard('court', 'veto', `killed $${coinLabel(pos.symbol)} at stop`, '✕');
         } else {
-          pushFeed('Grok Bot', `closed $${pos.symbol} ${pos.side} ${fmtUsd(netPnl, true)}`, fmtUsd(netPnl, true), 'win', nowTs);
-          pushToast('TRADE CLOSED', `${pos.symbol} ${pos.side} ${fmtUsd(netPnl, true)}`, `ROI +${roe.toFixed(1)}% · Balance ${fmtUsd(state.balance)}`, 'win');
-          setAgentCard('court', 'approved', `closed $${pos.symbol} +${roe.toFixed(1)}%`, '✓');
+          pushFeed('Grok Bot', `closed $${coinLabel(pos.symbol)} ${pos.side} ${fmtUsd(netPnl, true)}`, fmtUsd(netPnl, true), 'win', nowTs);
+          pushToast('TRADE CLOSED', `${coinLabel(pos.symbol)} ${pos.side} ${fmtUsd(netPnl, true)}`, `ROI +${roe.toFixed(1)}% · Balance ${fmtUsd(state.balance)}`, 'win');
+          setAgentCard('court', 'approved', `closed $${coinLabel(pos.symbol)} +${roe.toFixed(1)}%`, '✓');
         }
 
         showTradeClosedPopup(closedTrade);
@@ -719,8 +786,8 @@
 
     el.grokHub.classList.add('active');
     el.grokActionText.textContent = `${state.positions.length} ${dir.toLowerCase()}s · 20x`;
-    pushFeed('Grok Bot', `${dir === 'Long' ? 'L' : 'S'} $${cand.symbol} @ $${fmtPrice(cand.price)} · 20x`, 'OPEN', 'open', nowTs);
-    pushToast('OPEN', `${dir.toUpperCase()} $${cand.symbol} · 20x`, `Entry $${fmtPrice(cand.price)} · Margin ${fmtUsd(marginAlloc)} · Stop 0.6%`, 'info');
+    pushFeed('Grok Bot', `${dir === 'Long' ? 'L' : 'S'} $${coinLabel(cand.symbol)} @ $${fmtPrice(cand.price)} · 20x`, 'OPEN', 'open', nowTs);
+    pushToast('OPEN', `${dir.toUpperCase()} $${coinLabel(cand.symbol)} · 20x`, `Entry $${fmtPrice(cand.price)} · Margin ${fmtUsd(marginAlloc)} · Stop 0.6%`, 'info');
   }
 
   // Rendering
@@ -786,12 +853,12 @@
           <td>
             <span class="coin-cell">
               <span class="coin-mini-dot" style="background:${coinMeta.color}">${coinMeta.short}</span>
-              ${pos.symbol}
+              ${coinLabel(pos.symbol)}
               <span class="lev-tag">20x</span>
             </span>
           </td>
           <td><span class="side-pill ${pos.side.toLowerCase()}">${pos.side}</span></td>
-          <td>${fmtSize(pos.size)} ${pos.symbol}</td>
+          <td>${fmtSize(pos.size)} ${coinLabel(pos.symbol)}</td>
           <td>${fmtPrice(pos.entryPrice)}</td>
           <td>${fmtPrice(mark)}</td>
           <td class="${cls}">${fmtUsd(netEst, true)} (${netRoe >= 0 ? '+' : ''}${netRoe.toFixed(1)}%)</td>
@@ -816,7 +883,7 @@
           <td>
             <span class="coin-cell">
               <span class="coin-mini-dot" style="background:${coinMeta.color}">${coinMeta.short}</span>
-              ${tr.symbol}
+              ${coinLabel(tr.symbol)}
             </span>
           </td>
           <td><span class="side-pill ${tr.side.toLowerCase()}">${tr.side}</span></td>
@@ -1006,7 +1073,7 @@
       { key: 'NARRATIVE', cls: 'narrative', rule: 'no lone wolf vs board', val: state.vetoCounts.NARRATIVE, unit: 'vetoes' },
       { key: 'COURT', cls: 'court', rule: 'kills at 0.6% stop / noisy wick', val: state.vetoCounts.COURT, unit: 'stops/vetoes' },
       { key: 'RISK', cls: 'risk', rule: '20x · max 3 open · stop 0.6%', val: state.vetoCounts.RISK, unit: 'vetoes' },
-      { key: 'GROK', cls: 'grok', rule: '10 memecoins real-time scans', val: state.vetoCounts.GROK_SCANS, unit: 'scans', neutral: true }
+      { key: 'GROK', cls: 'grok', rule: `${COINS.length} perps real-time scans`, val: state.vetoCounts.GROK_SCANS, unit: 'scans', neutral: true }
     ];
     el.vetoList.innerHTML = rows.map(r => `
       <div class="veto-row">
@@ -1107,6 +1174,7 @@
     mode = 'live';
     if (comingFromReplay) {
       state = loadState('live');
+      sanitizeLegacyPositions();
       restoreLiveMarket();
     }
     el.btnLive.classList.add('active');
@@ -1283,6 +1351,11 @@
 
   // Boot
   (async function init() {
+    sanitizeLegacyPositions();
+    const boardTitle = document.querySelector('.board-card .panel-title');
+    if (boardTitle) boardTitle.textContent = `BOARD · ${COINS.length} PERPS`;
+    const chromeTitle = document.querySelector('.chrome-title');
+    if (chromeTitle) chromeTitle.textContent = `grok — trading-desk — 6 agents — ${COINS.length} perps`;
     renderAll();
     try {
       await fetchMarketSnapshot();
