@@ -628,7 +628,7 @@ html, body {
   width: 100%;
   border-collapse: collapse;
   font-size: 12.5px;
-  min-width: 780px;
+  min-width: 860px;
 }
 
 .desk-table th {
@@ -709,6 +709,8 @@ html, body {
 .pnl-neg { color: var(--loss-red); font-weight: 700; }
 .stop-cell { color: #fca5a5; }
 .tp-cell { color: #6ee7b7; }
+.tp-cell.trail { font-weight: 700; white-space: nowrap; }
+.reason-cell { color: #cbd5e1; font-size: 11.5px; }
 
 /* 4. SIX AGENTS PANEL */
 .agents-header {
