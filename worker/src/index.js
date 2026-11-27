@@ -4,18 +4,26 @@ import { DurableObject } from 'cloudflare:workers';
 import * as E from './engine.js';
 
 const HL_INFO_URL = 'https://api.hyperliquid.xyz/info';
-const CANDLE_COINS_PER_TICK = 12; // all 12 coins every minute (2 meta + 12 candles = 14 subrequests)
+const CANDLE_COINS_PER_TICK = 12; // all 12 coins every minute, fetched by 2 helper DO instances (6 each)
 const MAX_BODY = 600 * 1024;
 
+// Timeout timer is cleared as soon as the response is read, so no pending timer keeps the
+// invocation (and the Durable Object's billed duration) alive after the work is done.
 async function hlPost(payload) {
-  const res = await fetch(HL_INFO_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-    signal: AbortSignal.timeout(9000)
-  });
-  if (!res.ok) throw new Error(`Hyperliquid HTTP ${res.status}`);
-  return res.json();
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 9000);
+  try {
+    const res = await fetch(HL_INFO_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: ctrl.signal
+    });
+    if (!res.ok) throw new Error(`Hyperliquid HTTP ${res.status}`);
+    return await res.json();
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function fetchCandleRange(symbol, startTime, endTime) {
@@ -119,6 +127,20 @@ export class DeskBot extends DurableObject {
     return { ok: !meta.lastError, runCount: meta.runCount, lastRunAt: meta.lastRunAt };
   }
 
+  // Helper instances ('candles-a'/'candles-b') only fetch 5m candles; they never touch trading state.
+  // Splitting the 12 candle fetches across separate invocations keeps each one far below 10 ms CPU.
+  async fetchCandles5m(symbols, endTime) {
+    const out = {};
+    const errors = [];
+    await Promise.all((symbols || []).filter(s => E.KNOWN_SYMBOLS.has(s)).map(async sym => {
+      try {
+        const k = await hlPost({ type: 'candleSnapshot', req: { coin: sym, interval: '5m', startTime: endTime - 120 * 60000, endTime } });
+        if (Array.isArray(k)) out[sym] = k.slice(-30).map(x => ({ t: x.t, T: x.T, o: x.o, h: x.h, l: x.l, c: x.c, v: x.v }));
+      } catch (err) { errors.push(`candles ${sym}: ${err.message}`); }
+    }));
+    return { candles: out, errors };
+  }
+
   getState() {
     const state = this.state;
     const market = this.market || {};
@@ -192,7 +214,7 @@ async function readJson(request) {
 }
 
 // Runs in the cron Worker: fetch Hyperliquid data and keep only the 12 board coins.
-async function collectMarket(scheduledTime) {
+async function collectMarket(env, scheduledTime) {
   const errors = [];
   const idxByName = {};
   const dexes = [...new Set(E.COINS.map(c => c.dex || ''))];
@@ -214,11 +236,13 @@ async function collectMarket(scheduledTime) {
         });
       } catch (err) { errors.push(`meta ${dex || 'default'}: ${err.message}`); }
     }),
-    ...rot.map(async sym => {
+    ...[rot.slice(0, 6), rot.slice(6)].filter(g => g.length).map(async (group, gi) => {
       try {
-        const k = await hlPost({ type: 'candleSnapshot', req: { coin: sym, interval: '5m', startTime: endTime - 120 * 60000, endTime } });
-        if (Array.isArray(k)) candles[sym] = k.slice(-30).map(x => ({ t: x.t, T: x.T, o: x.o, h: x.h, l: x.l, c: x.c, v: x.v }));
-      } catch (err) { errors.push(`candles ${sym}: ${err.message}`); }
+        const helper = env.DESK.get(env.DESK.idFromName(gi === 0 ? 'candles-a' : 'candles-b'));
+        const r = await helper.fetchCandles5m(group, endTime);
+        Object.assign(candles, r.candles || {});
+        errors.push(...(r.errors || []));
+      } catch (err) { errors.push(`candles helper ${gi}: ${err.message}`); }
     })
   ]);
   return { idxByName, candles, errors };
@@ -259,7 +283,7 @@ export default {
 
   async scheduled(event, env, ctx) {
     ctx.waitUntil((async () => {
-      const payload = await collectMarket(event.scheduledTime || Date.now());
+      const payload = await collectMarket(env, event.scheduledTime || Date.now());
       await stub(env).tick(payload);
     })());
   }
