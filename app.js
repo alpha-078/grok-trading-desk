@@ -496,12 +496,18 @@
     const trailStop = pos.side === 'Long'
       ? pos.peakPrice * (1 - TRAIL_AFTER_TP_PCT)
       : pos.peakPrice * (1 + TRAIL_AFTER_TP_PCT);
+    // Safety floor: the trail must always lock a profit, never sit at/below entry (fees included).
+    const feeBuffer = 2 * TAKER_FEE;
+    const entryFloor = pos.side === 'Long'
+      ? pos.entryPrice * (1 + feeBuffer)
+      : pos.entryPrice * (1 - feeBuffer);
+    const safeTrail = pos.side === 'Long' ? Math.max(trailStop, entryFloor) : Math.min(trailStop, entryFloor);
     if (!Number.isFinite(pos.trailStop) || pos.trailStop <= 0) {
-      pos.trailStop = trailStop;
+      pos.trailStop = safeTrail;
     } else if (pos.side === 'Long') {
-      pos.trailStop = Math.max(pos.trailStop, trailStop);
+      pos.trailStop = Math.max(pos.trailStop, safeTrail);
     } else {
-      pos.trailStop = Math.min(pos.trailStop, trailStop);
+      pos.trailStop = Math.min(pos.trailStop, safeTrail);
     }
   }
 
