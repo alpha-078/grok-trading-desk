@@ -44,13 +44,19 @@ const c = (i, h, l) => ({ t: T0 + i * 60000, T: T0 + i * 60000 + 59999, h: Strin
   const closed = E.walkPositionCandles(s, p, [c(0, 100.2, 90)], T0 + 50000);
   assert.equal(closed, false);
 }
-// 5. Time exit after 6 min only before trail activation, at mark
+// 5. No time exit: positions stay open for days unless a price exit hits
 {
   const s = st(); const p = mk('Long', 100); s.positions = [p];
   const market = { XMR: { price: 100.5 } };
-  E.monitorWithMark(s, market, T0 + 5 * 60000); assert.equal(s.positions.length, 1);
-  E.monitorWithMark(s, market, T0 + 6 * 60000); assert.equal(s.positions.length, 0);
-  assert.equal(s.history[0].reason, 'EXIT GUARD: TIME'); near(s.history[0].exitPrice, 100.5);
+  for (const mins of [5, 6, 60, 3 * 24 * 60]) E.monitorWithMark(s, market, T0 + mins * 60000);
+  assert.equal(s.positions.length, 1); assert.equal(s.history.length, 0);
+  // still closes on the 1.5% stop (long: below entry)
+  E.monitorWithMark(s, { XMR: { price: 98.4 } }, T0 + 4 * 24 * 3600000);
+  assert.equal(s.positions.length, 0); near(s.history[0].exitPrice, 98.5); assert.equal(s.history[0].reason, 'COURT: KILLED AT STOP');
+  // short stop is above entry
+  const s3 = st(); const sh = mk('Short', 100); s3.positions = [sh];
+  E.monitorWithMark(s3, { XMR: { price: 99.2 } }, T0 + 9 * 24 * 3600000); assert.equal(s3.positions.length, 1);
+  E.monitorWithMark(s3, { XMR: { price: 101.6 } }, T0 + 9 * 24 * 3600000); assert.equal(s3.positions.length, 0); near(s3.history[0].exitPrice, 101.5);
   const s2 = st(); const q = mk('Long', 100, { trailActive: true, peakPrice: 102, trailStop: 100.98 }); s2.positions = [q];
   E.monitorWithMark(s2, { XMR: { price: 101.5 } }, T0 + 60 * 60000); assert.equal(s2.positions.length, 1);
 }

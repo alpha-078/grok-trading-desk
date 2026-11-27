@@ -16,8 +16,6 @@ export const MAX_POSITIONS = 3;
 export const ENTRY_THRESHOLD = 0.56;
 export const CANDLE_MS = 60000;
 export const CANDLE_MAX_BARS = 4000;
-// The phone's time exit was 90 live ticks x 4s = 6 minutes; on the server it is time-based.
-export const TIME_EXIT_MS = 90 * 4000;
 export const VETO_AGENT_ORDER = ['sniper', 'liquidity', 'narrative', 'court', 'risk'];
 
 export const COINS = [
@@ -268,9 +266,8 @@ export function applyV2Trail(pos) {
   else if (pos.side === 'Long') pos.trailStop = Math.max(pos.trailStop, safeTrail);
   else pos.trailStop = Math.min(pos.trailStop, safeTrail);
 }
-// opts.timeExitDue replaces the app's ageTicks >= 90 (4s ticks) with elapsed time.
+// No time-based exit: positions close only on price (stop 1.5%, trailing after +1.8%).
 export function evaluateExit(pos, mark, opts) {
-  const allowTimeExit = !opts || opts.allowTimeExit !== false;
   const allowTp = !opts || opts.allowTp !== false;
   const movePct = favorableMovePct(pos, mark);
   const v2 = isV2Exit(pos);
@@ -279,9 +276,8 @@ export function evaluateExit(pos, mark, opts) {
     && (pos.side === 'Long' ? mark <= pos.trailStop : mark >= pos.trailStop);
   const tpLevel = takeProfitPrice(pos);
   const hitTp = allowTp && !v2 && tpLevel > 0 && (pos.side === 'Long' ? mark >= tpLevel : mark <= tpLevel);
-  const hitTimeExit = allowTimeExit && !(v2 && pos.trailActive) && !!(opts && opts.timeExitDue) && Math.abs(movePct) > 0.001;
-  const shouldClose = !!(hitTrail || hitTp || hitInitialStop || hitTimeExit);
-  return { shouldClose, hitTrail, hitTp, hitInitialStop, hitTimeExit, movePct };
+  const shouldClose = !!(hitTrail || hitTp || hitInitialStop);
+  return { shouldClose, hitTrail, hitTp, hitInitialStop, movePct };
 }
 export function exitFillPrice(pos, ev, mark) {
   if (ev.hitTrail && Number.isFinite(pos.trailStop) && pos.trailStop > 0) return pos.trailStop;
@@ -294,14 +290,14 @@ export function exitReasonText(ev, netPnl) {
   if (ev.hitTp) return 'COURT: TAKE PROFIT';
   if (ev.hitInitialStop && netPnl < 0) return 'COURT: KILLED AT STOP';
   if (ev.hitInitialStop) return 'EXIT GUARD: TRAIL';
-  return 'EXIT GUARD: TIME';
+  return 'EXIT GUARD';
 }
 export function walkCandleForExit(pos, candle) {
   const h = parseFloat(candle.h), l = parseFloat(candle.l);
   const adverse = pos.side === 'Long' ? l : h;
   const favorable = pos.side === 'Long' ? h : l;
   if (!(adverse > 0) && !(favorable > 0)) return { close: false };
-  const noTimeNoTp = { allowTimeExit: false, allowTp: false };
+  const noTimeNoTp = { allowTp: false };
   const ts = Number(candle.t) || Date.now();
   if (adverse > 0) {
     const ev = evaluateExit(pos, adverse, noTimeNoTp);
@@ -314,7 +310,7 @@ export function walkCandleForExit(pos, candle) {
     if (ev.shouldClose) return { close: true, ev, fillPrice: exitFillPrice(pos, ev, adverse), ts };
   }
   if (!isV2Exit(pos) && favorable > 0) {
-    const ev = evaluateExit(pos, favorable, { allowTimeExit: false, allowTp: true });
+    const ev = evaluateExit(pos, favorable, { allowTp: true });
     if (ev.hitTp) return { close: true, ev, fillPrice: exitFillPrice(pos, ev, favorable), ts };
   }
   return { close: false };
@@ -397,7 +393,7 @@ export function walkPositionCandles(state, pos, candles, now) {
   return false;
 }
 
-// Mark-price check (app's monitorOpenPositions), with a time-based time exit.
+// Mark-price check (app's monitorOpenPositions). Price exits only, no time exit.
 export function monitorWithMark(state, market, nowTs) {
   const remaining = [];
   for (const pos of state.positions) {
@@ -405,7 +401,7 @@ export function monitorWithMark(state, market, nowTs) {
     if (!m || !m.price) { remaining.push(pos); continue; }
     const mark = m.price;
     pos.ageTicks = (pos.ageTicks || 0) + 1;
-    const opts = { timeExitDue: nowTs - (Number(pos.openedAt) || nowTs) >= TIME_EXIT_MS };
+    const opts = undefined;
     let ev = evaluateExit(pos, mark, opts);
     const crossedTrigger = ev.shouldClose && (ev.hitInitialStop || ev.hitTrail || ev.hitTp);
     if (!crossedTrigger) {

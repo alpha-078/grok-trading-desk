@@ -1,4 +1,4 @@
-const CACHE_NAME = 'grok-desk-v10';
+const CACHE_NAME = 'grok-desk-v11';
 const STATIC_ASSETS = [
   '/',
   '/index.html',

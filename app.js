@@ -530,7 +530,6 @@
   }
 
   function evaluateExit(pos, mark, modeName, opts) {
-    const allowTimeExit = !opts || opts.allowTimeExit !== false;
     const allowTp = !opts || opts.allowTp !== false;
     const movePct = favorableMovePct(pos, mark);
     const v2 = isV2Exit(pos);
@@ -540,13 +539,9 @@
     const tpLevel = takeProfitPrice(pos);
     const hitTp = allowTp && !v2 && tpLevel > 0
       && (pos.side === 'Long' ? mark >= tpLevel : mark <= tpLevel);
-    const timeLimit = modeName === 'replay' ? 22 : 90;
-    const hitTimeExit = allowTimeExit
-      && !(v2 && pos.trailActive)
-      && (pos.ageTicks || 0) >= timeLimit
-      && Math.abs(movePct) > 0.001;
-    const shouldClose = !!(hitTrail || hitTp || hitInitialStop || hitTimeExit);
-    return { shouldClose, hitTrail, hitTp, hitInitialStop, hitTimeExit, movePct };
+    // No time-based exit: positions close only on price (stop 1.5%, trailing after +1.8%).
+    const shouldClose = !!(hitTrail || hitTp || hitInitialStop);
+    return { shouldClose, hitTrail, hitTp, hitInitialStop, movePct };
   }
 
   function exitFillPrice(pos, ev, mark) {
@@ -569,7 +564,7 @@
     if (ev.hitTp) return 'COURT: TAKE PROFIT';
     if (ev.hitInitialStop && netPnl < 0) return 'COURT: KILLED AT STOP';
     if (ev.hitInitialStop) return 'EXIT GUARD: TRAIL';
-    return 'EXIT GUARD: TIME';
+    return 'EXIT GUARD';
   }
 
   function candleHighLow(candle) {
@@ -589,13 +584,13 @@
   }
 
   // Conservative 1m walk: check the adverse extreme against the current stop/trail
-  // first, then update the peak and ratchet. Time exits are never applied here.
+  // first, then update the peak and ratchet. There is no time-based exit.
   function walkCandleForExit(pos, candle) {
     const adverse = adverseExtreme(pos, candle);
     const favorable = favorableExtreme(pos, candle);
     if (!(adverse > 0) && !(favorable > 0)) return { close: false };
 
-    const noTimeNoTp = { allowTimeExit: false, allowTp: false };
+    const noTimeNoTp = { allowTp: false };
     if (adverse > 0) {
       const ev = evaluateExit(pos, adverse, 'live', noTimeNoTp);
       if (ev.shouldClose) {
@@ -615,7 +610,7 @@
     }
 
     if (!isV2Exit(pos) && favorable > 0) {
-      const ev = evaluateExit(pos, favorable, 'live', { allowTimeExit: false, allowTp: true });
+      const ev = evaluateExit(pos, favorable, 'live', { allowTp: true });
       if (ev.hitTp) {
         return { close: true, ev, fillPrice: exitFillPrice(pos, ev, favorable), ts: Number(candle.t) || Date.now() };
       }

@@ -103,7 +103,7 @@ export class DeskBot extends DurableObject {
           }
         }
         state.positions = remaining;
-        // 3b. Mark check + time exit, then the 6-agent cycle.
+        // 3b. Mark check (price exits only), then the 6-agent cycle.
         E.monitorWithMark(state, market, now);
         E.runSixAgentCycle(state, market, now);
         state.equityCurve.push({ t: now, v: E.getAccountEquity(state, market).equity, label: E.fmtShortTime(now) });
