@@ -1,4 +1,4 @@
-const CACHE_NAME = 'grok-desk-v9';
+const CACHE_NAME = 'grok-desk-v10';
 const STATIC_ASSETS = [
   '/',
   '/index.html',
@@ -28,8 +28,8 @@ self.addEventListener('activate', (event) => {
 
 self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
-  // Never intercept or cache Hyperliquid live API requests
-  if (url.hostname.includes('hyperliquid.xyz') || event.request.method !== 'GET') {
+  // Never intercept or cache Hyperliquid or the 24/7 server API
+  if (url.hostname.includes('hyperliquid.xyz') || url.hostname.endsWith('workers.dev') || event.request.method !== 'GET') {
     return;
   }
   event.respondWith(

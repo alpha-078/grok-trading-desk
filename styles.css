@@ -1330,3 +1330,48 @@ html, body {
     height: 195px;
   }
 }
+
+/* 24/7 server badge + offline banner */
+.server-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 12px;
+  border-radius: 10px;
+  background: rgba(20, 35, 70, 0.85);
+  border: 1px solid rgba(96, 165, 250, 0.45);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  color: #bfdbfe;
+  white-space: nowrap;
+}
+.server-badge.hidden { display: none; }
+.server-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #60a5fa;
+  box-shadow: 0 0 10px #60a5fa;
+  animation: pulseDot 1.6s infinite;
+}
+.server-badge.offline {
+  border-color: rgba(251, 113, 133, 0.5);
+  color: #fecdd3;
+  background: rgba(60, 20, 30, 0.85);
+}
+.server-badge.offline .server-dot {
+  background: #fb7185;
+  box-shadow: 0 0 10px #fb7185;
+}
+.server-banner {
+  margin: 0 0 12px;
+  padding: 10px 14px;
+  border-radius: 12px;
+  background: rgba(127, 29, 29, 0.55);
+  border: 1px solid rgba(251, 113, 133, 0.5);
+  color: #ffe4e6;
+  font-size: 13px;
+  font-weight: 600;
+}
+.server-banner.hidden { display: none; }

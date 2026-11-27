@@ -39,6 +39,9 @@
 
   <main class="desk-shell">
     <!-- 1. HERO HEADER -->
+    <div id="server-banner" class="server-banner hidden" role="status">
+      Serveur 24/7 injoignable ou en retard : moteur local de secours sur ce téléphone. Le compte serveur n'est pas modifié et reprendra la main au retour du réseau.
+    </div>
     <header class="card hero-card">
       <div class="hero-left">
         <div class="grok-avatar-box" aria-hidden="true">
@@ -84,6 +87,10 @@
             <span class="hl-dot"></span>
             <span class="hl-logo">Hyperliquid</span>
             <span id="hl-status-text" class="hl-state">Live API</span>
+          </div>
+          <div class="server-badge" id="server-badge" title="Le bot tourne sur un serveur Cloudflare 24/7 (argent fictif, prix réels Hyperliquid). Dernier passage du serveur.">
+            <span class="server-dot"></span>
+            <span id="server-badge-text">Serveur 24/7 · connexion…</span>
           </div>
           <div class="mode-controls">
             <button id="btn-mode-live" class="ctrl-btn active" type="button" title="Prix Hyperliquid en direct (toutes les 4s)">⚡ Live Réel</button>

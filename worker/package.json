@@ -1,0 +1,13 @@
+{
+  "name": "grok-trading-desk-bot",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node test/engine.test.mjs",
+    "dev": "wrangler dev --test-scheduled",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^4"
+  }
+}

@@ -1,0 +1,21 @@
+name = "grok-trading-desk-bot"
+main = "src/index.js"
+compatibility_date = "2025-09-01"
+workers_dev = true
+
+[triggers]
+crons = ["* * * * *"]
+
+[[durable_objects.bindings]]
+name = "DESK"
+class_name = "DeskBot"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["DeskBot"]
+
+[vars]
+ALLOWED_ORIGIN = "https://grok-bot-trading-desk.onrender.com"
+
+[observability]
+enabled = true

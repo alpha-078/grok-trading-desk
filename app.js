@@ -16,6 +16,11 @@
   const TAKER_FEE = 0.00035; // 0.035% notional simulated taker fee
   const MAX_POSITIONS = 3;
   const POLL_MS = 4000;
+  // 24/7 server bot (Cloudflare Worker + Durable Object). Live mode displays its state.
+  const SERVER_URL = 'https://grok-trading-desk-bot.alpha-078.workers.dev';
+  const SERVER_POLL_MS = 8000;
+  const SERVER_TIMEOUT_MS = 7000;
+  const SERVER_STALE_MS = 5 * 60 * 1000; // cron runs every minute; older than this = treat as down
   const REPLAY_STEP_MS = 650;
   const CANDLE_REFRESH_MS = 60000;
   const CANDLE_STAGGER_MS = 450;
@@ -58,6 +63,15 @@
   let deferredInstallPrompt = null;
   let popupTimer = null;
   let scanTick = 0;
+  let serverOnline = null;      // null = unknown, true = displaying server, false = local fallback
+  let serverMeta = null;
+  let lastServerFetchAt = 0;
+  let serverFetchInFlight = false;
+  let serverSeedTried = false;
+  let serverKnownTradeIds = null;
+  let serverKnownPosIds = null;
+  let serverUi = null;
+  let serverStale = false;
 
   // DOM refs
   const el = {
@@ -1339,7 +1353,7 @@
     el.feedList.innerHTML = state.feed.slice(0, 18).map(item => `
       <div class="feed-item">
         <div>
-          <div class="feed-head">${escapeHtml(item.agent)}<span class="feed-time">${item.time}</span></div>
+          <div class="feed-head">${escapeHtml(item.agent)}<span class="feed-time">${item.ts ? fmtShortTime(item.ts) : item.time}</span></div>
           <div class="feed-msg">${escapeHtml(item.text)}</div>
         </div>
         <span class="feed-badge ${item.kind}">${escapeHtml(item.badge)}</span>
@@ -1421,8 +1435,155 @@
     return String(s).replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
   }
 
+  // ===== 24/7 server mode =====
+  async function serverRequest(path, opts = {}) {
+    const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const timer = ctrl ? setTimeout(() => ctrl.abort(), SERVER_TIMEOUT_MS) : null;
+    try {
+      const res = await fetch(SERVER_URL + path, {
+        method: opts.method || 'GET',
+        headers: opts.body ? { 'Content-Type': 'application/json' } : undefined,
+        body: opts.body ? JSON.stringify(opts.body) : undefined,
+        cache: 'no-store',
+        signal: ctrl ? ctrl.signal : undefined
+      });
+      let data = null;
+      try { data = await res.json(); } catch { data = null; }
+      return { ok: res.ok, status: res.status, data };
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  function setServerBadge() {
+    const badge = document.getElementById('server-badge');
+    const text = document.getElementById('server-badge-text');
+    const banner = document.getElementById('server-banner');
+    if (!badge || !text) return;
+    const inLive = mode === 'live';
+    badge.classList.toggle('hidden', !inLive);
+    badge.classList.toggle('offline', serverOnline === false);
+    if (serverOnline === false) {
+      text.textContent = serverStale ? 'Serveur en retard' : 'Serveur injoignable';
+    } else if (serverMeta && serverMeta.lastRunAt) {
+      text.textContent = `Serveur 24/7 · ${fmtTime(serverMeta.lastRunAt)}`;
+    } else {
+      text.textContent = 'Serveur 24/7 · connexion…';
+    }
+    if (banner) banner.classList.toggle('hidden', !(inLive && serverOnline === false));
+  }
+
+  function applyServerUi() {
+    if (!serverUi || mode !== 'live') return;
+    const agents = serverUi.agents || {};
+    Object.keys(agents).forEach(id => {
+      const a = agents[id];
+      if (a) setAgentCard(id, a.status, a.desc, a.badge);
+    });
+    el.grokHub.classList.remove('active', 'veto');
+    if (serverUi.hub) el.grokHub.classList.add(serverUi.hub);
+    el.grokActionText.classList.remove('veto', 'scanning');
+    if (serverUi.actionCls) el.grokActionText.classList.add(serverUi.actionCls);
+    if (serverUi.actionText) el.grokActionText.textContent = serverUi.actionText;
+    const sig = Number(serverUi.signal);
+    if (Number.isFinite(sig)) {
+      el.signalVal.textContent = sig.toFixed(2);
+      el.signalBarFill.style.width = `${Math.round(sig * 100)}%`;
+    }
+    const vol = Number(serverUi.volumeMult);
+    if (Number.isFinite(vol)) {
+      el.volumeMult.textContent = `${vol.toFixed(1)}x`;
+      el.volumeBarFill.style.width = `${Math.min(100, Math.max(12, vol * 45))}%`;
+    }
+  }
+
+  function adoptServerState(data) {
+    const srv = data.state;
+    const isFirst = serverKnownTradeIds === null;
+    const history = Array.isArray(srv.history) ? srv.history : [];
+    const positions = Array.isArray(srv.positions) ? srv.positions : [];
+    if (!isFirst) {
+      const newTrades = history.filter(t => !serverKnownTradeIds.has(t.id));
+      newTrades.slice().reverse().forEach(t => {
+        const win = t.pnl >= 0;
+        pushToast(win ? 'TRADE CLOSED' : 'COURT', `${coinLabel(t.symbol)} ${t.side} ${fmtUsd(t.pnl, true)}`, `${t.reason} · Balance ${fmtUsd(t.balanceAfter)}`, win ? 'win' : 'stop');
+      });
+      if (newTrades.length) showTradeClosedPopup(newTrades[0]);
+      positions.filter(p => !serverKnownPosIds.has(p.id)).forEach(p => {
+        pushToast('OPEN', `${p.side.toUpperCase()} $${coinLabel(p.symbol)} · ${posLeverage(p)}x`, `Entry $${fmtPrice(p.entryPrice)} · Margin ${fmtUsd(p.margin)} · Stop 1.5%`, 'info');
+      });
+    }
+    serverKnownTradeIds = new Set(history.map(t => t.id));
+    serverKnownPosIds = new Set(positions.map(p => p.id));
+
+    const next = Object.assign(defaultState(), srv);
+    delete next.ui;
+    next._source = 'server';
+    state = next;
+    serverUi = srv.ui || null;
+    Object.entries(data.market || {}).forEach(([sym, m]) => {
+      const prev = market[sym] || { candles: [], ticks: [] };
+      market[sym] = Object.assign({}, prev, m, { candles: prev.candles || [], ticks: prev.ticks || [] });
+    });
+    // Cache locally (fallback start point). Never sent back to the server except as a first seed.
+    try { localStorage.setItem(STORAGE_KEY_LIVE, JSON.stringify(state)); } catch { /* quota */ }
+  }
+
+  // Returns true when the server handled this tick (display only), false to run the local engine.
+  async function serverLiveTick() {
+    if (mode !== 'live') return false;
+    const now = Date.now();
+    if (serverOnline === true && now - lastServerFetchAt < SERVER_POLL_MS) return true;
+    if (serverFetchInFlight) return serverOnline !== false;
+    serverFetchInFlight = true;
+    lastServerFetchAt = now;
+    try {
+      let res = await serverRequest('/api/state');
+      if (!res.ok || !res.data || !res.data.meta) throw new Error(`HTTP ${res.status}`);
+      if (!res.data.meta.initialized) {
+        if (serverSeedTried) throw new Error('server not initialized');
+        serverSeedTried = true;
+        // One-time migration of this phone's live account (only accepted while uninitialized).
+        const localLive = loadState('live');
+        const seedRes = await serverRequest('/api/seed', { method: 'POST', body: { state: localLive } });
+        if (!seedRes.ok && seedRes.status !== 409) throw new Error(`seed HTTP ${seedRes.status}`);
+        res = await serverRequest('/api/state');
+        if (!res.ok || !res.data || !res.data.meta || !res.data.meta.initialized) throw new Error('seed not applied');
+      }
+      if (mode !== 'live') return true;
+      const m = res.data.meta;
+      serverStale = !m.lastRunAt || (Number(m.serverTime) || Date.now()) - m.lastRunAt > SERVER_STALE_MS;
+      if (serverStale) {
+        serverMeta = m;
+        throw new Error('server cron is late');
+      }
+      const wasOffline = serverOnline === false;
+      serverMeta = res.data.meta;
+      serverOnline = true;
+      adoptServerState(res.data);
+      if (wasOffline) pushToast('SERVEUR', 'Serveur 24/7 reconnecté', 'Affichage du compte serveur (moteur local arrêté)', 'info');
+      setHlStatus(true, 'Serveur 24/7');
+      renderAll();
+      applyServerUi();
+      setServerBadge();
+      return true;
+    } catch (err) {
+      console.warn('Server unreachable, local fallback:', err);
+      if (!(err && err.message === 'server cron is late')) serverStale = false;
+      if (serverOnline !== false) {
+        serverOnline = false;
+      }
+      setServerBadge();
+      return false;
+    } finally {
+      serverFetchInFlight = false;
+    }
+  }
+
   // Live & Replay Loops
   async function liveTick() {
+    if (mode !== 'live') return;
+    if (await serverLiveTick()) return;
     if (mode !== 'live') return;
     try {
       await fetchMarketSnapshot();
@@ -1465,6 +1626,10 @@
     el.btnReplay.classList.remove('active');
     el.btnReplay.textContent = '▶ Replay 45m';
     el.chartModeLabel.textContent = 'Replay on real prices: paper money · Live Hyperliquid';
+    lastServerFetchAt = 0;
+    serverKnownTradeIds = null;
+    serverKnownPosIds = null;
+    setServerBadge();
     liveTick();
     liveTimer = setInterval(liveTick, POLL_MS);
     if (comingFromReplay) refreshLiveCandles({ force: true });
@@ -1477,6 +1642,8 @@
       backupLiveMarket();
     }
     stopTimers();
+    mode = 'replay-loading';
+    setServerBadge();
     el.btnReplay.classList.add('active');
     el.btnLive.classList.remove('active');
     el.btnReplay.textContent = '⏳ Chargement…';
@@ -1607,6 +1774,19 @@
     const label = isReplay ? 'la simulation Replay' : 'le compte Live';
     const other = isReplay ? 'le compte Live' : 'le Replay';
     if (!confirm(`Réinitialiser ${label} à $135.00 ? Cette action n'affecte pas ${other}.`)) return;
+    if (!isReplay && serverOnline === true) {
+      serverRequest('/api/reset', { method: 'POST', body: { confirm: true } }).then(res => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        serverKnownTradeIds = null;
+        serverKnownPosIds = null;
+        lastServerFetchAt = 0;
+        liveTick();
+      }).catch(err => alert(`Reset serveur impossible (${err.message}). Rien n'a été modifié.`));
+      return;
+    }
+    if (!isReplay && serverOnline === false) {
+      alert('Serveur injoignable : seul le moteur local de secours est réinitialisé. Le compte serveur reprendra la main au retour du réseau.');
+    }
     state = defaultState();
     saveState(); // writes only the current mode's storage key
     renderAll();
@@ -1635,6 +1815,11 @@
 
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState !== 'visible' || mode !== 'live') return;
+    if (serverOnline !== false) {
+      lastServerFetchAt = 0;
+      liveTick();
+      return;
+    }
     catchUpOpenPositions().then(closed => {
       if (mode !== 'live') return;
       if (closed) renderAll();
@@ -1651,7 +1836,7 @@
     renderAll();
     try {
       await fetchMarketSnapshot();
-      await catchUpOpenPositions();
+      if (state._source !== 'server') await catchUpOpenPositions();
       await preloadCandles('5m', 120);
       lastCandleRefreshAt = Date.now();
       renderAll();
