@@ -5,10 +5,19 @@ export const ENGINE_VERSION = 'server-v1';
 export const INITIAL_BALANCE = 135.0;
 export const LEVERAGE = 10;
 export const LEGACY_LEVERAGE = 20;
-export const STOP_PCT = 0.015;
+export const STOP_PCT = 0.015; // v2/legacy positions (already stored in pos.stopPrice)
 export const TP_PCT = 0.018;
 export const EXIT_MODE_V2 = 'v2-trail-at-tp';
 export const TRAIL_AFTER_TP_PCT = 0.01;
+// v3 (new trades from Nov 27 19:04): stop 1.2%, trail 0.5% activated at +1.2%,
+// 60m time exit only if the trade never reached +0.3% and the trail is not active.
+export const EXIT_MODE_V3 = 'v3-tight-trail';
+export const STOP_PCT_V3 = 0.012;
+export const TRAIL_ACTIVATE_V3_PCT = 0.012;
+export const TRAIL_GAP_V3_PCT = 0.005;
+export const TIME_EXIT_V3_MS = 60 * 60000;
+export const TIME_EXIT_V3_MIN_MFE = 0.003;
+export const COURT_MAX_RANGE_PCT = 1.45;
 export const LEGACY_TRAIL_ARM_PCT = 0.0085;
 export const LEGACY_TRAIL_GAP_PCT = 0.0035;
 export const TAKER_FEE = 0.00035;
@@ -72,8 +81,8 @@ export function defaultUi() {
       sniper: a('scanning', 'watching entry windows', '•'),
       liquidity: a('scanning', 'waiting for volume', '•'),
       narrative: a('scanning', 'reading the board', '•'),
-      court: a('scanning', 'stop 1.5% · R:R ready', '•'),
-      risk: a('scanning', `${LEVERAGE}x · 0/3 open · stop 1.5%`, '•')
+      court: a('scanning', 'stop 1.2% · R:R ready', '•'),
+      risk: a('scanning', `${LEVERAGE}x · 0/3 open · stop 1.2%`, '•')
     },
     hub: '',
     actionText: 'scanning',
@@ -145,7 +154,7 @@ export function sanitizeSeed(input, now = Date.now()) {
       peakPrice: num(p.peakPrice, entryPrice) || entryPrice, stopPrice,
       tpPrice: num(p.tpPrice) > 0 ? num(p.tpPrice) : undefined,
       leverage: num(p.leverage) > 0 ? num(p.leverage) : undefined,
-      exitMode: p.exitMode === EXIT_MODE_V2 ? EXIT_MODE_V2 : undefined,
+      exitMode: p.exitMode === EXIT_MODE_V2 || p.exitMode === EXIT_MODE_V3 ? p.exitMode : undefined,
       trailActive: !!p.trailActive,
       trailStop: num(p.trailStop) > 0 ? num(p.trailStop) : null,
       margin, entryFee: num(p.entryFee),
@@ -231,9 +240,20 @@ export function takeProfitPrice(pos) {
   if (Number.isFinite(pos.tpPrice) && pos.tpPrice > 0) return pos.tpPrice;
   const entry = Number(pos.entryPrice);
   if (!Number.isFinite(entry) || entry <= 0) return 0;
-  return pos.side === 'Long' ? entry * (1 + TP_PCT) : entry * (1 - TP_PCT);
+  const pct = isV3Exit(pos) ? TRAIL_ACTIVATE_V3_PCT : TP_PCT;
+  return pos.side === 'Long' ? entry * (1 + pct) : entry * (1 - pct);
 }
 export function isV2Exit(pos) { return !!(pos && pos.exitMode === EXIT_MODE_V2); }
+export function isV3Exit(pos) { return !!(pos && pos.exitMode === EXIT_MODE_V3); }
+// v2 and v3 both use "activate a trail at the level, never close at the level".
+export function isTrailExit(pos) { return isV2Exit(pos) || isV3Exit(pos); }
+// v3 only: 60m after open, trail not active, max favorable excursion (best price) < 0.3%.
+export function v3TimeExitDue(pos, ts) {
+  if (!isV3Exit(pos) || pos.trailActive) return false;
+  const opened = Number(pos.openedAt);
+  if (!Number.isFinite(opened) || !Number.isFinite(ts) || ts - opened < TIME_EXIT_V3_MS) return false;
+  return favorableMovePct(pos, pos.peakPrice || pos.entryPrice) < TIME_EXIT_V3_MIN_MFE;
+}
 export function favorableMovePct(pos, price) {
   const entry = pos.entryPrice;
   if (!(entry > 0) || !Number.isFinite(price)) return 0;
@@ -253,12 +273,13 @@ export function applyLegacyTrail(pos) {
 export function reachedTrailActivation(pos) {
   const tp = takeProfitPrice(pos);
   if (tp > 0) return pos.side === 'Long' ? pos.peakPrice >= tp : pos.peakPrice <= tp;
-  return favorableMovePct(pos, pos.peakPrice) >= TP_PCT;
+  return favorableMovePct(pos, pos.peakPrice) >= (isV3Exit(pos) ? TRAIL_ACTIVATE_V3_PCT : TP_PCT);
 }
 export function applyV2Trail(pos) {
   if (!pos.trailActive && reachedTrailActivation(pos)) pos.trailActive = true;
   if (!pos.trailActive) return;
-  const trailStop = pos.side === 'Long' ? pos.peakPrice * (1 - TRAIL_AFTER_TP_PCT) : pos.peakPrice * (1 + TRAIL_AFTER_TP_PCT);
+  const gap = isV3Exit(pos) ? TRAIL_GAP_V3_PCT : TRAIL_AFTER_TP_PCT;
+  const trailStop = pos.side === 'Long' ? pos.peakPrice * (1 - gap) : pos.peakPrice * (1 + gap);
   const feeBuffer = 2 * TAKER_FEE;
   const entryFloor = pos.side === 'Long' ? pos.entryPrice * (1 + feeBuffer) : pos.entryPrice * (1 - feeBuffer);
   const safeTrail = pos.side === 'Long' ? Math.max(trailStop, entryFloor) : Math.min(trailStop, entryFloor);
@@ -266,18 +287,20 @@ export function applyV2Trail(pos) {
   else if (pos.side === 'Long') pos.trailStop = Math.max(pos.trailStop, safeTrail);
   else pos.trailStop = Math.min(pos.trailStop, safeTrail);
 }
-// No time-based exit: positions close only on price (stop 1.5%, trailing after +1.8%).
+// v2: price exits only (stop 1.5%, trail 1% after +1.8%). v3: stop 1.2%, trail 0.5% after +1.2%,
+// plus the 60m time exit when opts.timeTs is given (see v3TimeExitDue).
 export function evaluateExit(pos, mark, opts) {
   const allowTp = !opts || opts.allowTp !== false;
   const movePct = favorableMovePct(pos, mark);
-  const v2 = isV2Exit(pos);
+  const v2 = isTrailExit(pos);
   const hitInitialStop = pos.side === 'Long' ? mark <= pos.stopPrice : mark >= pos.stopPrice;
   const hitTrail = v2 && !!pos.trailActive && Number.isFinite(pos.trailStop) && pos.trailStop > 0
     && (pos.side === 'Long' ? mark <= pos.trailStop : mark >= pos.trailStop);
   const tpLevel = takeProfitPrice(pos);
   const hitTp = allowTp && !v2 && tpLevel > 0 && (pos.side === 'Long' ? mark >= tpLevel : mark <= tpLevel);
-  const shouldClose = !!(hitTrail || hitTp || hitInitialStop);
-  return { shouldClose, hitTrail, hitTp, hitInitialStop, movePct };
+  const hitTimeExit = !!(opts && Number.isFinite(opts.timeTs)) && v3TimeExitDue(pos, opts.timeTs);
+  const shouldClose = !!(hitTrail || hitTp || hitInitialStop || hitTimeExit);
+  return { shouldClose, hitTrail, hitTp, hitInitialStop, hitTimeExit, movePct };
 }
 export function exitFillPrice(pos, ev, mark) {
   if (ev.hitTrail && Number.isFinite(pos.trailStop) && pos.trailStop > 0) return pos.trailStop;
@@ -287,6 +310,7 @@ export function exitFillPrice(pos, ev, mark) {
 }
 export function exitReasonText(ev, netPnl) {
   if (ev.hitTrail) return 'Trailing stop';
+  if (ev.hitTimeExit && !ev.hitInitialStop && !ev.hitTp) return 'EXIT GUARD: TIME 60m';
   if (ev.hitTp) return 'COURT: TAKE PROFIT';
   if (ev.hitInitialStop && netPnl < 0) return 'COURT: KILLED AT STOP';
   if (ev.hitInitialStop) return 'EXIT GUARD: TRAIL';
@@ -299,17 +323,25 @@ export function walkCandleForExit(pos, candle) {
   if (!(adverse > 0) && !(favorable > 0)) return { close: false };
   const noTimeNoTp = { allowTp: false };
   const ts = Number(candle.t) || Date.now();
+  // v3 time exit at the 60m mark: checked before this candle's prices, filled at its open.
+  if (v3TimeExitDue(pos, ts)) {
+    const openPx = parseFloat(candle.o);
+    if (openPx > 0) {
+      const ev = { shouldClose: true, hitTrail: false, hitTp: false, hitInitialStop: false, hitTimeExit: true, movePct: favorableMovePct(pos, openPx) };
+      return { close: true, ev, fillPrice: openPx, ts };
+    }
+  }
   if (adverse > 0) {
     const ev = evaluateExit(pos, adverse, noTimeNoTp);
     if (ev.shouldClose) return { close: true, ev, fillPrice: exitFillPrice(pos, ev, adverse), ts };
   }
   if (favorable > 0) updatePeakPrice(pos, favorable);
-  if (isV2Exit(pos)) applyV2Trail(pos); else applyLegacyTrail(pos);
+  if (isTrailExit(pos)) applyV2Trail(pos); else applyLegacyTrail(pos);
   if (adverse > 0) {
     const ev = evaluateExit(pos, adverse, noTimeNoTp);
     if (ev.shouldClose) return { close: true, ev, fillPrice: exitFillPrice(pos, ev, adverse), ts };
   }
-  if (!isV2Exit(pos) && favorable > 0) {
+  if (!isTrailExit(pos) && favorable > 0) {
     const ev = evaluateExit(pos, favorable, { allowTp: true });
     if (ev.hitTp) return { close: true, ev, fillPrice: exitFillPrice(pos, ev, favorable), ts };
   }
@@ -361,8 +393,8 @@ export function closeOpenPosition(state, pos, fillPrice, nowTs, ev) {
   state.equityCurve.push({ t: nowTs, v: state.balance, label: fmtShortTime(nowTs), tradeId: closedTrade.id });
   if (netPnl < 0) {
     state.vetoCounts.COURT += 1;
-    pushFeed(state, 'COURT', `stop $${coinLabel(pos.symbol)} ${fmtUsd(netPnl, true)} @ $${fmtPrice(fillPrice)}`, 'STOP', 'stop', nowTs);
-    setAgent(state, 'court', 'veto', `killed $${coinLabel(pos.symbol)} at stop`, '✕');
+    pushFeed(state, 'COURT', `${ev.hitTimeExit && !ev.hitInitialStop ? 'time 60m' : 'stop'} $${coinLabel(pos.symbol)} ${fmtUsd(netPnl, true)} @ $${fmtPrice(fillPrice)}`, 'STOP', 'stop', nowTs);
+    setAgent(state, 'court', 'veto', `killed $${coinLabel(pos.symbol)} ${ev.hitTimeExit && !ev.hitInitialStop ? 'at 60m' : 'at stop'}`, '✕');
   } else {
     pushFeed(state, 'Grok Bot', `closed $${coinLabel(pos.symbol)} ${pos.side} ${fmtUsd(netPnl, true)}`, ev.hitTrail ? 'TRAIL' : fmtUsd(netPnl, true), 'win', nowTs);
     setAgent(state, 'court', 'approved', `closed $${coinLabel(pos.symbol)} +${roe.toFixed(1)}%`, '✓');
@@ -393,7 +425,7 @@ export function walkPositionCandles(state, pos, candles, now) {
   return false;
 }
 
-// Mark-price check (app's monitorOpenPositions). Price exits only, no time exit.
+// Mark-price check (app's monitorOpenPositions). v3 also gets its 60m time exit here.
 export function monitorWithMark(state, market, nowTs) {
   const remaining = [];
   for (const pos of state.positions) {
@@ -401,12 +433,12 @@ export function monitorWithMark(state, market, nowTs) {
     if (!m || !m.price) { remaining.push(pos); continue; }
     const mark = m.price;
     pos.ageTicks = (pos.ageTicks || 0) + 1;
-    const opts = undefined;
+    const opts = { timeTs: nowTs };
     let ev = evaluateExit(pos, mark, opts);
     const crossedTrigger = ev.shouldClose && (ev.hitInitialStop || ev.hitTrail || ev.hitTp);
     if (!crossedTrigger) {
       updatePeakPrice(pos, mark);
-      if (isV2Exit(pos)) applyV2Trail(pos); else applyLegacyTrail(pos);
+      if (isTrailExit(pos)) applyV2Trail(pos); else applyLegacyTrail(pos);
       ev = evaluateExit(pos, mark, opts);
     }
     if (ev.shouldClose) closeOpenPosition(state, pos, exitFillPrice(pos, ev, mark), nowTs, ev);
@@ -449,7 +481,7 @@ export function runSixAgentCycle(state, market, nowTs) {
   ui.actionCls = '';
 
   if (state.positions.length >= MAX_POSITIONS) {
-    setAgent(state, 'risk', 'approved', `${LEVERAGE}x · ${state.positions.length}/${MAX_POSITIONS} open · stop 1.5%`, '✓');
+    setAgent(state, 'risk', 'approved', `${LEVERAGE}x · ${state.positions.length}/${MAX_POSITIONS} open · stop 1.2%`, '✓');
     setAgent(state, 'narrative', 'approved', `${greenCoins}/${totalActive} green · ${state.positions.length} active`, '✓');
     ui.hub = 'active';
     ui.actionText = `${state.positions.length} open · ${LEVERAGE}x`;
@@ -461,8 +493,8 @@ export function runSixAgentCycle(state, market, nowTs) {
     setAgent(state, 'sniper', 'scanning', 'watching entry windows', '•');
     setAgent(state, 'liquidity', 'approved', `board vol ${ui.volumeMult.toFixed(1)}x · ok`, '✓');
     setAgent(state, 'narrative', 'approved', `${greenCoins}/${totalActive} green · scanning`, '✓');
-    setAgent(state, 'court', 'approved', 'stop 1.5% · R:R ready', '✓');
-    setAgent(state, 'risk', 'approved', `${LEVERAGE}x · ${state.positions.length}/3 open · stop 1.5%`, '✓');
+    setAgent(state, 'court', 'approved', 'stop 1.2% · R:R ready', '✓');
+    setAgent(state, 'risk', 'approved', `${LEVERAGE}x · ${state.positions.length}/3 open · stop 1.2%`, '✓');
     return null;
   }
 
@@ -493,18 +525,18 @@ export function runSixAgentCycle(state, market, nowTs) {
     const h = parseFloat(lastC.h), l = parseFloat(lastC.l);
     if (l > 0) recentRangePct = ((h - l) / l) * 100;
   }
-  if (!killedBy && recentRangePct > 1.85) {
+  if (!killedBy && recentRangePct > COURT_MAX_RANGE_PCT) {
     state.vetoCounts.COURT += 1;
-    killedBy = { agent: 'COURT', card: 'court', reason: `wick ${recentRangePct.toFixed(2)}% > stop 1.5%` };
-    setAgent(state, 'court', 'veto', 'VETO · stop 1.5% too tight', '✕');
-  } else if (!killedBy) setAgent(state, 'court', 'approved', 'dies at stop 1.5% → OK', '✓');
+    killedBy = { agent: 'COURT', card: 'court', reason: `wick ${recentRangePct.toFixed(2)}% > stop 1.2%` };
+    setAgent(state, 'court', 'veto', 'VETO · stop 1.2% too tight', '✕');
+  } else if (!killedBy) setAgent(state, 'court', 'approved', 'dies at stop 1.2% → OK', '✓');
 
   const marginAlloc = Math.min(state.balance * 0.85, equity * 0.31);
   if (!killedBy && (alreadyHolding || marginAlloc < 5)) {
     state.vetoCounts.RISK += 1;
     killedBy = { agent: 'RISK', card: 'risk', reason: alreadyHolding ? `${cand.symbol} déjà ouvert` : 'marge insuffisante' };
     setAgent(state, 'risk', 'veto', `VETO · ${alreadyHolding ? 'déjà en cours' : 'low margin'}`, '✕');
-  } else if (!killedBy) setAgent(state, 'risk', 'approved', `${LEVERAGE}x · ${state.positions.length + 1}/3 open · stop 1.5%`, '✓');
+  } else if (!killedBy) setAgent(state, 'risk', 'approved', `${LEVERAGE}x · ${state.positions.length + 1}/3 open · stop 1.2%`, '✓');
 
   if (killedBy) {
     markLaterAgentsSkipped(state, killedBy.card);
@@ -518,12 +550,13 @@ export function runSixAgentCycle(state, market, nowTs) {
   const notional = marginAlloc * LEVERAGE;
   const size = notional / cand.price;
   const entryFee = notional * TAKER_FEE;
-  const stopPrice = dir === 'Long' ? cand.price * (1 - STOP_PCT) : cand.price * (1 + STOP_PCT);
-  const tpPrice = dir === 'Long' ? cand.price * (1 + TP_PCT) : cand.price * (1 - TP_PCT);
+  const stopPrice = dir === 'Long' ? cand.price * (1 - STOP_PCT_V3) : cand.price * (1 + STOP_PCT_V3);
+  // tpPrice = trail activation level (the trade does not close there).
+  const tpPrice = dir === 'Long' ? cand.price * (1 + TRAIL_ACTIVATE_V3_PCT) : cand.price * (1 - TRAIL_ACTIVATE_V3_PCT);
   state.balance -= marginAlloc;
   const newPos = {
     id: `${nowTs}-${cand.symbol}`, symbol: cand.symbol, side: dir, size, entryPrice: cand.price, peakPrice: cand.price,
-    stopPrice, tpPrice, leverage: LEVERAGE, exitMode: EXIT_MODE_V2, trailActive: false, trailStop: null,
+    stopPrice, tpPrice, leverage: LEVERAGE, exitMode: EXIT_MODE_V3, trailActive: false, trailStop: null,
     margin: marginAlloc, entryFee, openedAt: nowTs, lastCheckedTs: nowTs, ageTicks: 0
   };
   state.positions.push(newPos);

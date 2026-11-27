@@ -4,7 +4,7 @@ import { DurableObject } from 'cloudflare:workers';
 import * as E from './engine.js';
 
 const HL_INFO_URL = 'https://api.hyperliquid.xyz/info';
-const CANDLE_COINS_PER_TICK = 4;
+const CANDLE_COINS_PER_TICK = 12; // all 12 coins every minute (2 meta + 12 candles = 14 subrequests)
 const MAX_BODY = 600 * 1024;
 
 async function hlPost(payload) {
@@ -31,7 +31,7 @@ async function fetchCandleRange(symbol, startTime, endTime) {
         const t = Number(c.t);
         if (!Number.isFinite(t) || seen.has(t)) continue;
         seen.add(t);
-        all.push({ t: c.t, T: c.T, h: c.h, l: c.l });
+        all.push({ t: c.t, T: c.T, o: c.o, h: c.h, l: c.l });
       }
     }
     if (end >= endTime) break;
@@ -77,7 +77,7 @@ export class DeskBot extends DurableObject {
       if (Object.keys(idxByName).length === 0) throw new Error(errors.join('; ') || 'no market data');
       const { market } = E.buildMarket(this.market, idxByName);
       this.market = market;
-      // 2. Rotating 5m candles (4 coins per minute, every coin every 3 minutes).
+      // 2. Fresh 5m candles for all 12 coins every minute.
       for (const [sym, candles] of Object.entries((payload && payload.candles) || {})) {
         E.applyCandlesToMarket(market, sym, candles);
       }

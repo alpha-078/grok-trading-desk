@@ -6,10 +6,19 @@
   const STORAGE_KEY_REPLAY = 'grok_trading_desk_replay_v1';
   const INITIAL_BALANCE = 135.0;
   const LEVERAGE = 10;
-  const STOP_PCT = 0.015; // 1.5% price move => 15% ROE at 10x
+  const STOP_PCT = 0.015; // v2/legacy positions (stored in pos.stopPrice); new trades use STOP_PCT_V3
   const TP_PCT = 0.018;   // 1.8% from entry: hard TP on legacy positions; trail activation on v2
   const EXIT_MODE_V2 = 'v2-trail-at-tp';
   const TRAIL_AFTER_TP_PCT = 0.01; // v2: 1% trail from peak/trough after +1.8%
+  // v3 (new trades from Nov 27 19:04): stop 1.2%, trail 0.5% activated at +1.2%,
+  // 60m time exit only if the trade never reached +0.3% and the trail is not active.
+  const EXIT_MODE_V3 = 'v3-tight-trail';
+  const STOP_PCT_V3 = 0.012;
+  const TRAIL_ACTIVATE_V3_PCT = 0.012;
+  const TRAIL_GAP_V3_PCT = 0.005;
+  const TIME_EXIT_V3_MS = 60 * 60000;
+  const TIME_EXIT_V3_MIN_MFE = 0.003;
+  const COURT_MAX_RANGE_PCT = 1.45;
   const LEGACY_TRAIL_ARM_PCT = 0.0085;
   const LEGACY_TRAIL_GAP_PCT = 0.0035;
   const LEGACY_LEVERAGE = 20; // fallback for positions opened before leverage was stored
@@ -463,11 +472,29 @@
     if (Number.isFinite(pos.tpPrice) && pos.tpPrice > 0) return pos.tpPrice;
     const entry = Number(pos.entryPrice);
     if (!Number.isFinite(entry) || entry <= 0) return 0;
-    return pos.side === 'Long' ? entry * (1 + TP_PCT) : entry * (1 - TP_PCT);
+    const pct = isV3Exit(pos) ? TRAIL_ACTIVATE_V3_PCT : TP_PCT;
+    return pos.side === 'Long' ? entry * (1 + pct) : entry * (1 - pct);
   }
 
   function isV2Exit(pos) {
     return !!(pos && pos.exitMode === EXIT_MODE_V2);
+  }
+
+  function isV3Exit(pos) {
+    return !!(pos && pos.exitMode === EXIT_MODE_V3);
+  }
+
+  // v2 and v3 both activate a trail at the level and never close at the level.
+  function isTrailExit(pos) {
+    return isV2Exit(pos) || isV3Exit(pos);
+  }
+
+  // v3 only: 60m after open, trail not active, max favorable excursion (best price) < 0.3%.
+  function v3TimeExitDue(pos, ts) {
+    if (!isV3Exit(pos) || pos.trailActive) return false;
+    const opened = Number(pos.openedAt);
+    if (!Number.isFinite(opened) || !Number.isFinite(ts) || ts - opened < TIME_EXIT_V3_MS) return false;
+    return favorableMovePct(pos, pos.peakPrice || pos.entryPrice) < TIME_EXIT_V3_MIN_MFE;
   }
 
   function favorableMovePct(pos, price) {
@@ -496,14 +523,14 @@
     }
   }
 
-  // New exits: +1.8% activates a 1% trail from the best price since activation.
-  // Does not close at the 1.8% level. Ratchets only in the favorable direction.
+  // v2: +1.8% activates a 1% trail; v3: +1.2% activates a 0.5% trail (from the best price).
+  // Does not close at the activation level. Ratchets only in the favorable direction.
   function reachedTrailActivation(pos) {
     const tp = takeProfitPrice(pos);
     if (tp > 0) {
       return pos.side === 'Long' ? pos.peakPrice >= tp : pos.peakPrice <= tp;
     }
-    return favorableMovePct(pos, pos.peakPrice) >= TP_PCT;
+    return favorableMovePct(pos, pos.peakPrice) >= (isV3Exit(pos) ? TRAIL_ACTIVATE_V3_PCT : TP_PCT);
   }
 
   function applyV2Trail(pos) {
@@ -511,9 +538,10 @@
       pos.trailActive = true;
     }
     if (!pos.trailActive) return;
+    const gap = isV3Exit(pos) ? TRAIL_GAP_V3_PCT : TRAIL_AFTER_TP_PCT;
     const trailStop = pos.side === 'Long'
-      ? pos.peakPrice * (1 - TRAIL_AFTER_TP_PCT)
-      : pos.peakPrice * (1 + TRAIL_AFTER_TP_PCT);
+      ? pos.peakPrice * (1 - gap)
+      : pos.peakPrice * (1 + gap);
     // Safety floor: the trail must always lock a profit, never sit at/below entry (fees included).
     const feeBuffer = 2 * TAKER_FEE;
     const entryFloor = pos.side === 'Long'
@@ -532,16 +560,17 @@
   function evaluateExit(pos, mark, modeName, opts) {
     const allowTp = !opts || opts.allowTp !== false;
     const movePct = favorableMovePct(pos, mark);
-    const v2 = isV2Exit(pos);
+    const v2 = isTrailExit(pos);
     const hitInitialStop = pos.side === 'Long' ? mark <= pos.stopPrice : mark >= pos.stopPrice;
     const hitTrail = v2 && !!pos.trailActive && Number.isFinite(pos.trailStop) && pos.trailStop > 0
       && (pos.side === 'Long' ? mark <= pos.trailStop : mark >= pos.trailStop);
     const tpLevel = takeProfitPrice(pos);
     const hitTp = allowTp && !v2 && tpLevel > 0
       && (pos.side === 'Long' ? mark >= tpLevel : mark <= tpLevel);
-    // No time-based exit: positions close only on price (stop 1.5%, trailing after +1.8%).
-    const shouldClose = !!(hitTrail || hitTp || hitInitialStop);
-    return { shouldClose, hitTrail, hitTp, hitInitialStop, movePct };
+    // v2: price exits only. v3: plus the 60m time exit when opts.timeTs is given.
+    const hitTimeExit = !!(opts && Number.isFinite(opts.timeTs)) && v3TimeExitDue(pos, opts.timeTs);
+    const shouldClose = !!(hitTrail || hitTp || hitInitialStop || hitTimeExit);
+    return { shouldClose, hitTrail, hitTp, hitInitialStop, hitTimeExit, movePct };
   }
 
   function exitFillPrice(pos, ev, mark) {
@@ -559,8 +588,10 @@
       if (ev.hitTrail) return 'Trailing stop (hors ligne)';
       if (ev.hitTp) return 'Take profit (hors ligne)';
       if (ev.hitInitialStop) return 'Stop-loss (hors ligne)';
+      if (ev.hitTimeExit) return 'EXIT GUARD: TIME 60m (hors ligne)';
     }
     if (ev.hitTrail) return 'Trailing stop';
+    if (ev.hitTimeExit && !ev.hitInitialStop && !ev.hitTp) return 'EXIT GUARD: TIME 60m';
     if (ev.hitTp) return 'COURT: TAKE PROFIT';
     if (ev.hitInitialStop && netPnl < 0) return 'COURT: KILLED AT STOP';
     if (ev.hitInitialStop) return 'EXIT GUARD: TRAIL';
@@ -584,11 +615,21 @@
   }
 
   // Conservative 1m walk: check the adverse extreme against the current stop/trail
-  // first, then update the peak and ratchet. There is no time-based exit.
+  // first, then update the peak and ratchet. v3 time exit uses candle timestamps.
   function walkCandleForExit(pos, candle) {
     const adverse = adverseExtreme(pos, candle);
     const favorable = favorableExtreme(pos, candle);
     if (!(adverse > 0) && !(favorable > 0)) return { close: false };
+
+    // v3 time exit at the 60m mark: checked before this candle's prices, filled at its open.
+    const candleTs = Number(candle.t);
+    if (v3TimeExitDue(pos, candleTs)) {
+      const openPx = parseFloat(candle.o);
+      if (openPx > 0) {
+        const ev = { shouldClose: true, hitTrail: false, hitTp: false, hitInitialStop: false, hitTimeExit: true, movePct: favorableMovePct(pos, openPx) };
+        return { close: true, ev, fillPrice: openPx, ts: candleTs };
+      }
+    }
 
     const noTimeNoTp = { allowTp: false };
     if (adverse > 0) {
@@ -599,7 +640,7 @@
     }
 
     if (favorable > 0) updatePeakPrice(pos, favorable);
-    if (isV2Exit(pos)) applyV2Trail(pos);
+    if (isTrailExit(pos)) applyV2Trail(pos);
     else applyLegacyTrail(pos);
 
     if (adverse > 0) {
@@ -609,7 +650,7 @@
       }
     }
 
-    if (!isV2Exit(pos) && favorable > 0) {
+    if (!isTrailExit(pos) && favorable > 0) {
       const ev = evaluateExit(pos, favorable, 'live', { allowTp: true });
       if (ev.hitTp) {
         return { close: true, ev, fillPrice: exitFillPrice(pos, ev, favorable), ts: Number(candle.t) || Date.now() };
@@ -807,9 +848,10 @@
 
     if (netPnl < 0) {
       state.vetoCounts.COURT += 1;
-      pushFeed('COURT', `${offline ? 'stop hors ligne' : 'stop'} $${coinLabel(pos.symbol)} ${fmtUsd(netPnl, true)} @ $${fmtPrice(fillPrice)}`, 'STOP', 'stop', nowTs);
-      pushToast('COURT', offline ? 'STOP-LOSS (HORS LIGNE)' : 'COURT: KILLED AT STOP', `#${state.history.length} ${coinLabel(pos.symbol)} ${pos.side.toLowerCase()} · ${fmtUsd(netPnl, true)} · ${fmtPrice(fillPrice)}`, 'stop');
-      setAgentCard('court', 'veto', `killed $${coinLabel(pos.symbol)} at stop`, '✕');
+      const timeOut = ev.hitTimeExit && !ev.hitInitialStop;
+      pushFeed('COURT', `${timeOut ? (offline ? 'time 60m hors ligne' : 'time 60m') : (offline ? 'stop hors ligne' : 'stop')} $${coinLabel(pos.symbol)} ${fmtUsd(netPnl, true)} @ $${fmtPrice(fillPrice)}`, 'STOP', 'stop', nowTs);
+      pushToast('COURT', timeOut ? 'EXIT GUARD: TIME 60m' : (offline ? 'STOP-LOSS (HORS LIGNE)' : 'COURT: KILLED AT STOP'), `#${state.history.length} ${coinLabel(pos.symbol)} ${pos.side.toLowerCase()} · ${fmtUsd(netPnl, true)} · ${fmtPrice(fillPrice)}`, 'stop');
+      setAgentCard('court', 'veto', `killed $${coinLabel(pos.symbol)} ${timeOut ? 'at 60m' : 'at stop'}`, '✕');
     } else {
       const trailNote = ev.hitTrail ? (offline ? 'trailing stop hors ligne · ' : 'trailing stop · ') : '';
       pushFeed('Grok Bot', `closed $${coinLabel(pos.symbol)} ${pos.side} ${fmtUsd(netPnl, true)}`, ev.hitTrail ? 'TRAIL' : fmtUsd(netPnl, true), 'win', nowTs);
@@ -834,13 +876,14 @@
 
       // If the mark already crossed a stop/trail/TP (including a gap while closed),
       // fill at the trigger price like a stop order — do not use the gapped mark.
-      let ev = evaluateExit(pos, mark, mode);
+      const timeOpts = { timeTs: nowTs };
+      let ev = evaluateExit(pos, mark, mode, timeOpts);
       const crossedTrigger = ev.shouldClose && (ev.hitInitialStop || ev.hitTrail || ev.hitTp);
       if (!crossedTrigger) {
         updatePeakPrice(pos, mark);
-        if (isV2Exit(pos)) applyV2Trail(pos);
+        if (isTrailExit(pos)) applyV2Trail(pos);
         else applyLegacyTrail(pos);
-        ev = evaluateExit(pos, mark, mode);
+        ev = evaluateExit(pos, mark, mode, timeOpts);
       }
 
       if (ev.shouldClose) {
@@ -949,7 +992,7 @@
     el.grokActionText.classList.remove('veto', 'scanning');
 
     if (state.positions.length >= MAX_POSITIONS) {
-      setAgentCard('risk', 'approved', `${LEVERAGE}x · ${state.positions.length}/${MAX_POSITIONS} open · stop 1.5%`, '✓');
+      setAgentCard('risk', 'approved', `${LEVERAGE}x · ${state.positions.length}/${MAX_POSITIONS} open · stop 1.2%`, '✓');
       setAgentCard('narrative', 'approved', `${greenCoins}/${totalActive} green · ${state.positions.length} active`, '✓');
       el.grokHub.classList.add('active');
       el.grokActionText.textContent = `${state.positions.length} open · ${LEVERAGE}x`;
@@ -964,8 +1007,8 @@
       setAgentCard('sniper', 'scanning', 'watching entry windows', '•');
       setAgentCard('liquidity', 'approved', `board vol ${el.volumeMult.textContent} · ok`, '✓');
       setAgentCard('narrative', 'approved', `${greenCoins}/${totalActive} green · scanning`, '✓');
-      setAgentCard('court', 'approved', 'stop 1.5% · R:R ready', '✓');
-      setAgentCard('risk', 'approved', `${LEVERAGE}x · ${state.positions.length}/3 open · stop 1.5%`, '✓');
+      setAgentCard('court', 'approved', 'stop 1.2% · R:R ready', '✓');
+      setAgentCard('risk', 'approved', `${LEVERAGE}x · ${state.positions.length}/3 open · stop 1.2%`, '✓');
       return;
     }
 
@@ -1002,19 +1045,19 @@
       setAgentCard('narrative', 'approved', `${greenCoins}/${totalActive} green · ${cand.symbol} cleanest`, '✓');
     }
 
-    // Agent 5: COURT (Volatility vs 1.5% stop viability)
+    // Agent 5: COURT (Volatility vs 1.2% stop viability)
     let recentRangePct = 0.4;
     if (cand.candles && cand.candles.length >= 2) {
       const lastC = cand.candles[cand.candles.length - 1];
       const h = parseFloat(lastC.h), l = parseFloat(lastC.l);
       if (l > 0) recentRangePct = ((h - l) / l) * 100;
     }
-    if (!killedBy && recentRangePct > 1.85) {
+    if (!killedBy && recentRangePct > COURT_MAX_RANGE_PCT) {
       state.vetoCounts.COURT += 1;
-      killedBy = { agent: 'COURT', card: 'court', reason: `wick ${recentRangePct.toFixed(2)}% > stop 1.5%` };
-      setAgentCard('court', 'veto', `VETO · stop 1.5% too tight`, '✕');
+      killedBy = { agent: 'COURT', card: 'court', reason: `wick ${recentRangePct.toFixed(2)}% > stop 1.2%` };
+      setAgentCard('court', 'veto', `VETO · stop 1.2% too tight`, '✕');
     } else if (!killedBy) {
-      setAgentCard('court', 'approved', 'dies at stop 1.5% → OK', '✓');
+      setAgentCard('court', 'approved', 'dies at stop 1.2% → OK', '✓');
     }
 
     // Agent 6: RISK (Treasury, max exposure & duplicate check)
@@ -1024,7 +1067,7 @@
       killedBy = { agent: 'RISK', card: 'risk', reason: alreadyHolding ? `${cand.symbol} déjà ouvert` : 'marge insuffisante' };
       setAgentCard('risk', 'veto', `VETO · ${alreadyHolding ? 'déjà en cours' : 'low margin'}`, '✕');
     } else if (!killedBy) {
-      setAgentCard('risk', 'approved', `${LEVERAGE}x · ${state.positions.length + 1}/3 open · stop 1.5%`, '✓');
+      setAgentCard('risk', 'approved', `${LEVERAGE}x · ${state.positions.length + 1}/3 open · stop 1.2%`, '✓');
     }
 
     if (killedBy) {
@@ -1043,11 +1086,11 @@
     const size = notional / cand.price;
     const entryFee = notional * TAKER_FEE;
     const stopPrice = dir === 'Long'
-      ? cand.price * (1 - STOP_PCT)
-      : cand.price * (1 + STOP_PCT);
+      ? cand.price * (1 - STOP_PCT_V3)
+      : cand.price * (1 + STOP_PCT_V3);
     const tpPrice = dir === 'Long'
-      ? cand.price * (1 + TP_PCT)
-      : cand.price * (1 - TP_PCT);
+      ? cand.price * (1 + TRAIL_ACTIVATE_V3_PCT)
+      : cand.price * (1 - TRAIL_ACTIVATE_V3_PCT);
 
     state.balance -= marginAlloc;
     const newPos = {
@@ -1060,7 +1103,7 @@
       stopPrice,
       tpPrice,
       leverage: LEVERAGE,
-      exitMode: EXIT_MODE_V2,
+      exitMode: EXIT_MODE_V3,
       trailActive: false,
       trailStop: null,
       margin: marginAlloc,
@@ -1074,7 +1117,7 @@
     el.grokHub.classList.add('active');
     el.grokActionText.textContent = `${state.positions.length} ${dir.toLowerCase()}s · ${LEVERAGE}x`;
     pushFeed('Grok Bot', `${dir === 'Long' ? 'L' : 'S'} $${coinLabel(cand.symbol)} @ $${fmtPrice(cand.price)} · ${LEVERAGE}x`, 'OPEN', 'open', nowTs);
-    pushToast('OPEN', `${dir.toUpperCase()} $${coinLabel(cand.symbol)} · ${LEVERAGE}x`, `Entry $${fmtPrice(cand.price)} · Margin ${fmtUsd(marginAlloc)} · Stop 1.5%`, 'info');
+    pushToast('OPEN', `${dir.toUpperCase()} $${coinLabel(cand.symbol)} · ${LEVERAGE}x`, `Entry $${fmtPrice(cand.price)} · Margin ${fmtUsd(marginAlloc)} · Stop 1.2%`, 'info');
   }
 
   // Rendering
@@ -1151,7 +1194,7 @@
           <td>${fmtPrice(mark)}</td>
           <td class="${cls}">${fmtUsd(netEst, true)} (${netRoe >= 0 ? '+' : ''}${netRoe.toFixed(1)}%)</td>
           <td class="stop-cell">${fmtPrice(pos.stopPrice)}</td>
-          <td class="tp-cell${isV2Exit(pos) && pos.trailActive ? ' trail' : ''}">${isV2Exit(pos) && pos.trailActive && pos.trailStop > 0 ? `Trail @ ${fmtPrice(pos.trailStop)}` : fmtPrice(tpPx)}</td>
+          <td class="tp-cell${isTrailExit(pos) && pos.trailActive ? ' trail' : ''}">${isTrailExit(pos) && pos.trailActive && pos.trailStop > 0 ? `Trail @ ${fmtPrice(pos.trailStop)}` : fmtPrice(tpPx)}</td>
           <td class="right">${fmtUsd(pos.margin)}</td>
         </tr>
       `;
@@ -1361,8 +1404,8 @@
       { key: 'SNIPER', cls: 'sniper', rule: 'first 15m of a fresh pump', val: state.vetoCounts.SNIPER, unit: 'vetoes' },
       { key: 'LIQUIDITY', cls: 'liquidity', rule: 'vol < 0.42x avg or delisted', val: state.vetoCounts.LIQUIDITY, unit: 'vetoes' },
       { key: 'NARRATIVE', cls: 'narrative', rule: 'no lone wolf vs board', val: state.vetoCounts.NARRATIVE, unit: 'vetoes' },
-      { key: 'COURT', cls: 'court', rule: 'kills at 1.5% stop / noisy wick', val: state.vetoCounts.COURT, unit: 'stops/vetoes' },
-      { key: 'RISK', cls: 'risk', rule: `${LEVERAGE}x · max 3 open · stop 1.5%`, val: state.vetoCounts.RISK, unit: 'vetoes' },
+      { key: 'COURT', cls: 'court', rule: 'kills at 1.2% stop / noisy wick', val: state.vetoCounts.COURT, unit: 'stops/vetoes' },
+      { key: 'RISK', cls: 'risk', rule: `${LEVERAGE}x · max 3 open · stop 1.2%`, val: state.vetoCounts.RISK, unit: 'vetoes' },
       { key: 'GROK', cls: 'grok', rule: `${COINS.length} perps real-time scans`, val: state.vetoCounts.GROK_SCANS, unit: 'scans', neutral: true }
     ];
     el.vetoList.innerHTML = rows.map(r => `
@@ -1505,7 +1548,7 @@
       });
       if (newTrades.length) showTradeClosedPopup(newTrades[0]);
       positions.filter(p => !serverKnownPosIds.has(p.id)).forEach(p => {
-        pushToast('OPEN', `${p.side.toUpperCase()} $${coinLabel(p.symbol)} · ${posLeverage(p)}x`, `Entry $${fmtPrice(p.entryPrice)} · Margin ${fmtUsd(p.margin)} · Stop 1.5%`, 'info');
+        pushToast('OPEN', `${p.side.toUpperCase()} $${coinLabel(p.symbol)} · ${posLeverage(p)}x`, `Entry $${fmtPrice(p.entryPrice)} · Margin ${fmtUsd(p.margin)} · Stop 1.2%`, 'info');
       });
     }
     serverKnownTradeIds = new Set(history.map(t => t.id));
