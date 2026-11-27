@@ -19,6 +19,9 @@
   const REPLAY_STEP_MS = 650;
   const CANDLE_REFRESH_MS = 60000;
   const CANDLE_STAGGER_MS = 450;
+  const CANDLE_MS = 60 * 1000;
+  const CANDLE_MAX_BARS = 4000; // under Hyperliquid's ~5000/request cap
+  const CATCHUP_GAP_MS = POLL_MS + 1500;
   const VETO_AGENT_ORDER = ['sniper', 'liquidity', 'narrative', 'court', 'risk'];
 
   const COINS = [
@@ -49,6 +52,7 @@
   let replayIdx = 0;
   let lastCandleRefreshAt = 0;
   let candleRefreshInFlight = false;
+  let catchUpInFlight = false;
   let liveMarketBackup = null;
   let activeTab = 'positions';
   let deferredInstallPrompt = null;
@@ -511,21 +515,144 @@
     }
   }
 
-  function evaluateExit(pos, mark, modeName) {
+  function evaluateExit(pos, mark, modeName, opts) {
+    const allowTimeExit = !opts || opts.allowTimeExit !== false;
+    const allowTp = !opts || opts.allowTp !== false;
     const movePct = favorableMovePct(pos, mark);
     const v2 = isV2Exit(pos);
     const hitInitialStop = pos.side === 'Long' ? mark <= pos.stopPrice : mark >= pos.stopPrice;
     const hitTrail = v2 && !!pos.trailActive && Number.isFinite(pos.trailStop) && pos.trailStop > 0
       && (pos.side === 'Long' ? mark <= pos.trailStop : mark >= pos.trailStop);
     const tpLevel = takeProfitPrice(pos);
-    const hitTp = !v2 && tpLevel > 0
+    const hitTp = allowTp && !v2 && tpLevel > 0
       && (pos.side === 'Long' ? mark >= tpLevel : mark <= tpLevel);
     const timeLimit = modeName === 'replay' ? 22 : 90;
-    const hitTimeExit = !(v2 && pos.trailActive)
+    const hitTimeExit = allowTimeExit
+      && !(v2 && pos.trailActive)
       && (pos.ageTicks || 0) >= timeLimit
       && Math.abs(movePct) > 0.001;
     const shouldClose = !!(hitTrail || hitTp || hitInitialStop || hitTimeExit);
     return { shouldClose, hitTrail, hitTp, hitInitialStop, hitTimeExit, movePct };
+  }
+
+  function exitFillPrice(pos, ev, mark) {
+    if (ev.hitTrail && Number.isFinite(pos.trailStop) && pos.trailStop > 0) return pos.trailStop;
+    if (ev.hitInitialStop && Number.isFinite(pos.stopPrice) && pos.stopPrice > 0) return pos.stopPrice;
+    if (ev.hitTp) {
+      const tp = takeProfitPrice(pos);
+      if (tp > 0) return tp;
+    }
+    return mark;
+  }
+
+  function exitReasonText(ev, netPnl, offline) {
+    if (offline) {
+      if (ev.hitTrail) return 'Trailing stop (hors ligne)';
+      if (ev.hitTp) return 'Take profit (hors ligne)';
+      if (ev.hitInitialStop) return 'Stop-loss (hors ligne)';
+    }
+    if (ev.hitTrail) return 'Trailing stop';
+    if (ev.hitTp) return 'COURT: TAKE PROFIT';
+    if (ev.hitInitialStop && netPnl < 0) return 'COURT: KILLED AT STOP';
+    if (ev.hitInitialStop) return 'EXIT GUARD: TRAIL';
+    return 'EXIT GUARD: TIME';
+  }
+
+  function candleHighLow(candle) {
+    const h = parseFloat(candle.h);
+    const l = parseFloat(candle.l);
+    return { high: h, low: l };
+  }
+
+  function adverseExtreme(pos, candle) {
+    const { high, low } = candleHighLow(candle);
+    return pos.side === 'Long' ? low : high;
+  }
+
+  function favorableExtreme(pos, candle) {
+    const { high, low } = candleHighLow(candle);
+    return pos.side === 'Long' ? high : low;
+  }
+
+  // Conservative 1m walk: check the adverse extreme against the current stop/trail
+  // first, then update the peak and ratchet. Time exits are never applied here.
+  function walkCandleForExit(pos, candle) {
+    const adverse = adverseExtreme(pos, candle);
+    const favorable = favorableExtreme(pos, candle);
+    if (!(adverse > 0) && !(favorable > 0)) return { close: false };
+
+    const noTimeNoTp = { allowTimeExit: false, allowTp: false };
+    if (adverse > 0) {
+      const ev = evaluateExit(pos, adverse, 'live', noTimeNoTp);
+      if (ev.shouldClose) {
+        return { close: true, ev, fillPrice: exitFillPrice(pos, ev, adverse), ts: Number(candle.t) || Date.now() };
+      }
+    }
+
+    if (favorable > 0) updatePeakPrice(pos, favorable);
+    if (isV2Exit(pos)) applyV2Trail(pos);
+    else applyLegacyTrail(pos);
+
+    if (adverse > 0) {
+      const ev = evaluateExit(pos, adverse, 'live', noTimeNoTp);
+      if (ev.shouldClose) {
+        return { close: true, ev, fillPrice: exitFillPrice(pos, ev, adverse), ts: Number(candle.t) || Date.now() };
+      }
+    }
+
+    if (!isV2Exit(pos) && favorable > 0) {
+      const ev = evaluateExit(pos, favorable, 'live', { allowTimeExit: false, allowTp: true });
+      if (ev.hitTp) {
+        return { close: true, ev, fillPrice: exitFillPrice(pos, ev, favorable), ts: Number(candle.t) || Date.now() };
+      }
+    }
+    return { close: false };
+  }
+
+  function candleEndTs(candle) {
+    const end = Number(candle.T);
+    if (Number.isFinite(end) && end > 0) return end;
+    const start = Number(candle.t);
+    return Number.isFinite(start) ? start + CANDLE_MS : Date.now();
+  }
+
+  async function fetchCandleRange(symbol, startTime, endTime) {
+    const all = [];
+    let start = startTime;
+    const seen = new Set();
+    while (start < endTime) {
+      const end = Math.min(endTime, start + CANDLE_MAX_BARS * CANDLE_MS);
+      const candles = await hlPost({
+        type: 'candleSnapshot',
+        req: { coin: symbol, interval: '1m', startTime: start, endTime: end }
+      });
+      if (Array.isArray(candles)) {
+        for (const c of candles) {
+          const t = Number(c.t);
+          if (!Number.isFinite(t) || seen.has(t)) continue;
+          seen.add(t);
+          all.push(c);
+        }
+      }
+      if (end >= endTime) break;
+      start = end;
+    }
+    all.sort((a, b) => Number(a.t) - Number(b.t));
+    return all;
+  }
+
+  function positionCheckStart(pos) {
+    const last = Number(pos.lastCheckedTs);
+    if (Number.isFinite(last) && last > 0) return last;
+    const opened = Number(pos.openedAt);
+    if (Number.isFinite(opened) && opened > 0) return opened;
+    return 0;
+  }
+
+  function needsCatchUp(pos, now) {
+    const start = positionCheckStart(pos);
+    if (!start) return false;
+    return now - start > CATCHUP_GAP_MS;
   }
 
   // Paper Trading Engine + 6 Agents
@@ -633,6 +760,58 @@
     });
   }
 
+  function closeOpenPosition(pos, fillPrice, nowTs, ev, offline) {
+    const { pnlGross } = calcPositionMetrics(pos, fillPrice);
+    const exitFee = pos.size * fillPrice * TAKER_FEE;
+    const netPnl = pnlGross - (pos.entryFee || 0) - exitFee;
+    const roe = (netPnl / pos.margin) * 100;
+
+    state.balance = Math.max(1.0, state.balance + pos.margin + netPnl);
+    state.lastClosedPnl = netPnl;
+
+    const reason = exitReasonText(ev, netPnl, !!offline);
+    const closedTrade = {
+      id: pos.id,
+      time: fmtShortTime(nowTs),
+      ts: nowTs,
+      curveTime: nowTs,
+      symbol: pos.symbol,
+      side: pos.side,
+      size: pos.size,
+      entryPrice: pos.entryPrice,
+      exitPrice: fillPrice,
+      pnl: netPnl,
+      roe,
+      margin: pos.margin,
+      leverage: posLeverage(pos),
+      balanceAfter: state.balance,
+      reason
+    };
+
+    state.history.unshift(closedTrade);
+    state.equityCurve.push({
+      t: nowTs,
+      v: state.balance,
+      label: fmtShortTime(nowTs),
+      tradeId: closedTrade.id
+    });
+
+    if (netPnl < 0) {
+      state.vetoCounts.COURT += 1;
+      pushFeed('COURT', `${offline ? 'stop hors ligne' : 'stop'} $${coinLabel(pos.symbol)} ${fmtUsd(netPnl, true)} @ $${fmtPrice(fillPrice)}`, 'STOP', 'stop', nowTs);
+      pushToast('COURT', offline ? 'STOP-LOSS (HORS LIGNE)' : 'COURT: KILLED AT STOP', `#${state.history.length} ${coinLabel(pos.symbol)} ${pos.side.toLowerCase()} · ${fmtUsd(netPnl, true)} · ${fmtPrice(fillPrice)}`, 'stop');
+      setAgentCard('court', 'veto', `killed $${coinLabel(pos.symbol)} at stop`, '✕');
+    } else {
+      const trailNote = ev.hitTrail ? (offline ? 'trailing stop hors ligne · ' : 'trailing stop · ') : '';
+      pushFeed('Grok Bot', `closed $${coinLabel(pos.symbol)} ${pos.side} ${fmtUsd(netPnl, true)}`, ev.hitTrail ? 'TRAIL' : fmtUsd(netPnl, true), 'win', nowTs);
+      pushToast('TRADE CLOSED', `${coinLabel(pos.symbol)} ${pos.side} ${fmtUsd(netPnl, true)}`, `${trailNote}ROI +${roe.toFixed(1)}% · Balance ${fmtUsd(state.balance)}`, 'win');
+      setAgentCard('court', 'approved', `closed $${coinLabel(pos.symbol)} +${roe.toFixed(1)}%`, '✓');
+    }
+
+    showTradeClosedPopup(closedTrade);
+    return closedTrade;
+  }
+
   function monitorOpenPositions(nowTs) {
     const remaining = [];
     for (const pos of state.positions) {
@@ -642,73 +821,82 @@
         continue;
       }
       const mark = m.price;
-      pos.ageTicks = (pos.ageTicks || 0) + 1;
+      if (mode === 'live') pos.ageTicks = (pos.ageTicks || 0) + 1;
 
-      updatePeakPrice(pos, mark);
-      if (isV2Exit(pos)) applyV2Trail(pos);
-      else applyLegacyTrail(pos);
+      // If the mark already crossed a stop/trail/TP (including a gap while closed),
+      // fill at the trigger price like a stop order — do not use the gapped mark.
+      let ev = evaluateExit(pos, mark, mode);
+      const crossedTrigger = ev.shouldClose && (ev.hitInitialStop || ev.hitTrail || ev.hitTp);
+      if (!crossedTrigger) {
+        updatePeakPrice(pos, mark);
+        if (isV2Exit(pos)) applyV2Trail(pos);
+        else applyLegacyTrail(pos);
+        ev = evaluateExit(pos, mark, mode);
+      }
 
-      const { shouldClose, hitTrail, hitTp, hitInitialStop, hitTimeExit } = evaluateExit(pos, mark, mode);
-
-      if (shouldClose) {
-        const { pnlGross } = calcPositionMetrics(pos, mark);
-        const exitFee = pos.size * mark * TAKER_FEE;
-        const netPnl = pnlGross - pos.entryFee - exitFee;
-        const roe = (netPnl / pos.margin) * 100;
-
-        state.balance = Math.max(1.0, state.balance + pos.margin + netPnl);
-        state.lastClosedPnl = netPnl;
-
-        const reason = hitTrail
-          ? 'Trailing stop'
-          : (hitTp
-            ? 'COURT: TAKE PROFIT'
-            : (hitInitialStop && netPnl < 0 ? 'COURT: KILLED AT STOP' : (hitInitialStop ? 'EXIT GUARD: TRAIL' : 'EXIT GUARD: TIME')));
-
-        const closedTrade = {
-          id: pos.id,
-          time: fmtShortTime(nowTs),
-          ts: nowTs,
-          curveTime: nowTs,
-          symbol: pos.symbol,
-          side: pos.side,
-          size: pos.size,
-          entryPrice: pos.entryPrice,
-          exitPrice: mark,
-          pnl: netPnl,
-          roe,
-          margin: pos.margin,
-          leverage: posLeverage(pos),
-          balanceAfter: state.balance,
-          reason
-        };
-
-        state.history.unshift(closedTrade);
-        state.equityCurve.push({
-          t: nowTs,
-          v: state.balance,
-          label: fmtShortTime(nowTs),
-          tradeId: closedTrade.id
-        });
-
-        if (netPnl < 0) {
-          state.vetoCounts.COURT += 1;
-          pushFeed('COURT', `stop $${coinLabel(pos.symbol)} ${fmtUsd(netPnl, true)}`, 'STOP', 'stop', nowTs);
-          pushToast('COURT', 'COURT: KILLED AT STOP', `#${state.history.length} ${coinLabel(pos.symbol)} ${pos.side.toLowerCase()} · ${fmtUsd(netPnl, true)} · stop`, 'stop');
-          setAgentCard('court', 'veto', `killed $${coinLabel(pos.symbol)} at stop`, '✕');
-        } else {
-          const trailNote = hitTrail ? 'trailing stop · ' : '';
-          pushFeed('Grok Bot', `closed $${coinLabel(pos.symbol)} ${pos.side} ${fmtUsd(netPnl, true)}`, hitTrail ? 'TRAIL' : fmtUsd(netPnl, true), 'win', nowTs);
-          pushToast('TRADE CLOSED', `${coinLabel(pos.symbol)} ${pos.side} ${fmtUsd(netPnl, true)}`, `${trailNote}ROI +${roe.toFixed(1)}% · Balance ${fmtUsd(state.balance)}`, 'win');
-          setAgentCard('court', 'approved', `closed $${coinLabel(pos.symbol)} +${roe.toFixed(1)}%`, '✓');
-        }
-
-        showTradeClosedPopup(closedTrade);
+      if (ev.shouldClose) {
+        const fillPrice = exitFillPrice(pos, ev, mark);
+        closeOpenPosition(pos, fillPrice, nowTs, ev, false);
       } else {
+        if (mode === 'live') pos.lastCheckedTs = nowTs;
         remaining.push(pos);
       }
     }
     state.positions = remaining;
+  }
+
+  async function catchUpOpenPositions() {
+    if (mode !== 'live' || catchUpInFlight) return false;
+    const now = Date.now();
+    const due = (state.positions || []).filter(p => needsCatchUp(p, now));
+    if (due.length === 0) return false;
+    catchUpInFlight = true;
+    let anyClose = false;
+    try {
+      const remaining = [];
+      for (const pos of state.positions) {
+        if (!needsCatchUp(pos, now)) {
+          remaining.push(pos);
+          continue;
+        }
+        const start = positionCheckStart(pos);
+        if (!start) {
+          pos.lastCheckedTs = now;
+          remaining.push(pos);
+          continue;
+        }
+        try {
+          const fetchStart = Math.max(0, start - CANDLE_MS);
+          const candles = await fetchCandleRange(pos.symbol, fetchStart, now);
+          let closed = false;
+          for (const candle of candles) {
+            const end = candleEndTs(candle);
+            if (end <= start) continue;
+            const result = walkCandleForExit(pos, candle);
+            if (result.close) {
+              closeOpenPosition(pos, result.fillPrice, result.ts || Number(candle.t) || now, result.ev, true);
+              closed = true;
+              anyClose = true;
+              break;
+            }
+            pos.lastCheckedTs = Math.max(pos.lastCheckedTs || 0, end);
+          }
+          if (!closed) {
+            pos.lastCheckedTs = now;
+            remaining.push(pos);
+          }
+        } catch (err) {
+          console.warn('Catch-up failed for', pos.symbol, err);
+          remaining.push(pos);
+        }
+        await sleep(CANDLE_STAGGER_MS);
+      }
+      state.positions = remaining;
+    } finally {
+      catchUpInFlight = false;
+    }
+    if (anyClose) saveState();
+    return anyClose;
   }
 
   function runSixAgentCycle(nowTs) {
@@ -869,6 +1057,7 @@
       margin: marginAlloc,
       entryFee,
       openedAt: nowTs,
+      lastCheckedTs: nowTs,
       ageTicks: 0
     };
     state.positions.push(newPos);
@@ -1241,8 +1430,11 @@
       // without blocking the 4s live poll.
       refreshLiveCandles();
       const now = Date.now();
-      monitorOpenPositions(now);
-      runSixAgentCycle(now);
+      if ((state.positions || []).some(p => needsCatchUp(p, now))) {
+        await catchUpOpenPositions();
+      }
+      monitorOpenPositions(Date.now());
+      runSixAgentCycle(Date.now());
 
       // Append curve point periodically so live chart progresses smoothly
       const lastPt = state.equityCurve[state.equityCurve.length - 1];
@@ -1441,6 +1633,14 @@
     });
   }
 
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible' || mode !== 'live') return;
+    catchUpOpenPositions().then(closed => {
+      if (mode !== 'live') return;
+      if (closed) renderAll();
+    }).catch(err => console.warn('Catch-up on resume failed:', err));
+  });
+
   // Boot
   (async function init() {
     sanitizeLegacyPositions();
@@ -1451,6 +1651,7 @@
     renderAll();
     try {
       await fetchMarketSnapshot();
+      await catchUpOpenPositions();
       await preloadCandles('5m', 120);
       lastCandleRefreshAt = Date.now();
       renderAll();
